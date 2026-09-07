@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-lru-expert-cache"
+version = "0.1.0"
+description = "Device-side LRU expert cache for vLLM MoE models: keep N experts resident in VRAM, stream the rest from host RAM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["numpy", "pytest"]
+
+# vLLM auto-loads this at engine startup, so no launch-flag or code change is needed:
+# installing the package is what arms the cache.
+[project.entry-points."vllm.general_plugins"]
+lru_expert_cache = "vllm_lru_cache:install"
+
+[tool.setuptools]
+packages = ["vllm_lru_cache", "vllm_lru_cache.backends"]
+
+[tool.setuptools.package-data]
+vllm_lru_cache = ["*.so"]
