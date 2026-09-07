@@ -6,7 +6,7 @@
 #   ./build.sh gfx90a gfx1201  # fat binary for CDNA2 + RDNA4
 #
 # The kernels use only block-level LDS reductions, so one source serves wave64 and wave32.
-# Drop the result next to the Python package (vllm_lru_cache/) or point VLLM_LRU_LIB at it.
+# Drop the result next to the Python package (vllm_lru_cache/) or point LRU_CACHE_LIB at it.
 set -euo pipefail
 cd "$(dirname "$0")"
 

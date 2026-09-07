@@ -6,7 +6,7 @@
 (b) data:   the gathered slabs must be bit-identical to the source rows.
 (c) timing: manager + gather at production shapes.
 
-Needs one GPU and a built liblruexpert.so (see kernels/build.sh). Point VLLM_LRU_LIB at
+Needs one GPU and a built liblruexpert.so (see kernels/build.sh). Point LRU_CACHE_LIB at
 the library if it is not next to the package. Set TRACE=<routes.npz> to additionally
 replay a captured routing trace.
 """
@@ -17,17 +17,20 @@ import sys
 import numpy as np
 import torch
 
-LIB = os.environ.get("VLLM_LRU_LIB", "../vllm_lru_cache/liblruexpert.so")
+LIB = os.environ.get("LRU_CACHE_LIB", "../vllm_lru_cache/liblruexpert.so")
 lib = ctypes.CDLL(LIB)
 hip = ctypes.CDLL("libamdhip64.so")
 
 lib.lru_manage.restype = ctypes.c_int
 lib.lru_manage.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 5 + \
-    [ctypes.c_void_p] * 8 + [ctypes.c_void_p]
+    [ctypes.c_void_p] * 8 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
 lib.lru_gather.restype = ctypes.c_int
 lib.lru_gather.argtypes = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long] * 6 +
                                [ctypes.c_void_p, ctypes.c_void_p,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_void_p])
+
+POLICY = int(os.environ.get("POLICY", "0"))  # 0 = LRU (matches the numpy reference)
+DECAY = int(os.environ.get("DECAY", "64"))
 
 DEV = "cuda:0"
 FAIL = []
@@ -118,6 +121,7 @@ def run_manage(s, ids_t, max_distinct, max_inserts):
         ctypes.c_void_p(s.slot_expert.data_ptr()), ctypes.c_void_p(s.slot_stamp.data_ptr()),
         ctypes.c_void_p(s.routed.data_ptr()), ctypes.c_void_p(s.step.data_ptr()),
         ctypes.c_void_p(s.miss.data_ptr()), ctypes.c_void_p(s.n_miss.data_ptr()),
+        POLICY, DECAY,
         ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
     assert rc == 0, f"lru_manage rc={rc}"
 

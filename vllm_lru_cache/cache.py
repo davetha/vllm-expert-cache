@@ -23,6 +23,7 @@ import os
 import torch
 
 from ._lib import GATHER_SLOTS, lib
+from .config import settings
 
 
 def _bytes_per_expert(t: torch.Tensor) -> int:
@@ -58,8 +59,10 @@ class ExpertSlotCache:
         self.miss = torch.zeros((2 * self.S,), dtype=i32, device=device)
         self.n_miss = torch.zeros((1,), dtype=i32, device=device)
 
-        self.chunks = int(os.environ.get("VLLM_LRU_CHUNKS", "16"))
-        self.lanes = int(os.environ.get("VLLM_LRU_LANES", "64"))
+        self.policy = settings.policy_code
+        self.decay = settings.decay
+        self.chunks = int(os.environ.get("LRU_CACHE_CHUNKS", "16"))
+        self.lanes = int(os.environ.get("LRU_CACHE_LANES", "64"))
 
     def fits(self, topk_ids: torch.Tensor) -> bool:
         """Can this step be served entirely from slots?
@@ -91,6 +94,7 @@ class ExpertSlotCache:
             ctypes.c_void_p(self.step.data_ptr()),
             ctypes.c_void_p(self.miss.data_ptr()),
             ctypes.c_void_p(self.n_miss.data_ptr()),
+            self.policy, self.decay,
             stream,
         )
         if rc != 0:

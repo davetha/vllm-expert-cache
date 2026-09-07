@@ -5,7 +5,7 @@ so a mixture-of-experts model that does not fit on the GPU still decodes at clos
 fully-resident speed.
 
 vLLM loads this automatically through the `vllm.general_plugins` entry point; installing
-the package is enough. Set `VLLM_LRU_DISABLE=1` to turn it off without uninstalling.
+the package is enough. Set `LRU_CACHE_DISABLE=1` to turn it off without uninstalling.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ def install() -> None:
         logger = logging.getLogger("vllm_lru_cache")
 
     if settings.disabled:
-        logger.info("lru-expert-cache: disabled by VLLM_LRU_DISABLE")
+        logger.info("lru-expert-cache: disabled by LRU_CACHE_DISABLE")
         return
 
     from .backends import compressed_tensors_int8

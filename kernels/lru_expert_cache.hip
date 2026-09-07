@@ -200,7 +200,9 @@ extern "C" __global__ __launch_bounds__(NT) void lru_manage_k(
     unsigned char* __restrict__ routed,   // [E]  scratch
     long long* __restrict__ step,         // [1]
     int* __restrict__ miss,               // [2*max_inserts] (expert, slot) pairs
-    int* __restrict__ n_miss) {           // [1]
+    int* __restrict__ n_miss,             // [1]
+    int policy,                           // 0 = LRU (recency), 1 = LFU (frequency)
+    int decay) {                          // LFU: halve every `decay` steps, 0 = never
   __shared__ int sh[NT];
   __shared__ long long shl[NT];
   __shared__ int s_se[MAXS];              // slot -> expert, mirrored so victim selection
@@ -237,7 +239,9 @@ extern "C" __global__ __launch_bounds__(NT) void lru_manage_k(
   for (int e = lo; e < hi; e++) {
     if (!routed[e]) continue;
     const int s = table[e];
-    if (s >= 0) slot_stamp[s] = st;
+    // LRU stores recency (the step it was last routed); LFU stores a hit count.
+    // Distinct experts occupy distinct slots, so no two threads write one slot.
+    if (s >= 0) slot_stamp[s] = (policy == 0) ? st : (slot_stamp[s] + 1);
     else local++;
   }
   __syncthreads();
@@ -253,17 +257,22 @@ extern "C" __global__ __launch_bounds__(NT) void lru_manage_k(
       j++;
     }
   }
+  // LFU ages its counts so an expert that was hot once cannot squat a slot forever.
+  const bool do_decay = (policy != 0 && decay > 0 && (st % (long long)decay) == 0);
   for (int i = t; i < S; i += NT) {
     s_se[i] = slot_expert[i];
-    s_st[i] = slot_stamp[i];
+    long long v = slot_stamp[i];
+    if (do_decay) v >>= 1;
+    s_st[i] = v;
   }
   __syncthreads();
 
   // victims = the nins slots with the smallest (stamp, slot) among those whose expert is
   // NOT routed this step, so a slot needed by this very step -- including one just filled
   // -- is never taken
-  const int nact = pickVictims(S, nins, st, routed, s_se, s_st, s_key, s_vic, shl,
-                               table, map_cold, miss);
+  // third argument is the priority a freshly installed expert receives.
+  const int nact = pickVictims(S, nins, (policy == 0) ? st : 1LL, routed,
+                               s_se, s_st, s_key, s_vic, shl, table, map_cold, miss);
 
   for (int i = t; i < S; i += NT) {
     slot_expert[i] = s_se[i];
@@ -583,12 +592,13 @@ extern "C" {
 int lru_manage(const int* topk_ids, int mk, int E, int S, int max_distinct,
                    int max_inserts, int* table, int* map_cold, int* slot_expert,
                    long long* slot_stamp, unsigned char* routed, long long* step,
-                   int* miss, int* n_miss, hipStream_t stream) {
+                   int* miss, int* n_miss, int policy, int decay, hipStream_t stream) {
   if (E <= 0 || S <= 0 || S > MAXS || S > SLOT_MASK) return -1;
   if (max_inserts < 0 || max_inserts > MAXINS) return -1;   // s_vic is MAXINS deep
+  if (policy < 0 || policy > 1) return -1;
   hipLaunchKernelGGL(lru_manage_k, dim3(1), dim3(NT), 0, stream, topk_ids, mk, E, S,
                      max_distinct, max_inserts, table, map_cold, slot_expert, slot_stamp,
-                     routed, step, miss, n_miss);
+                     routed, step, miss, n_miss, policy, decay);
   return (int)hipGetLastError();
 }
 

@@ -41,7 +41,7 @@ patched vLLM checkout.
 Run the model with expert offload as usual; the cache layers on top of it:
 
 ```bash
-VLLM_LRU_SLOTS=64 vllm serve <model> \
+LRU_CACHE_SLOTS=64 vllm serve <model> \
   --tensor-parallel-size 2 \
   --cpu-offload-gb 22 --cpu-offload-params experts
 ```
@@ -50,11 +50,13 @@ VLLM_LRU_SLOTS=64 vllm serve <model> \
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `VLLM_LRU_SLOTS` | — | Experts kept resident, as an absolute count |
-| `VLLM_LRU_FRACTION` | `0.5` | Used when `VLLM_LRU_SLOTS` is unset: fraction of experts to keep |
-| `VLLM_LRU_DISABLE` | `0` | `1` turns the cache off without uninstalling |
-| `VLLM_LRU_LIB` | — | Path to `liblruexpert.so` if it is not beside the package |
-| `VLLM_LRU_CHUNKS` / `VLLM_LRU_LANES` | `16` / `64` | Gather kernel grid shape |
+| `LRU_CACHE_SLOTS` | — | Experts kept resident, as an absolute count |
+| `LRU_CACHE_FRACTION` | `0.5` | Used when `LRU_CACHE_SLOTS` is unset: fraction of experts to keep |
+| `LRU_CACHE_DISABLE` | `0` | `1` turns the cache off without uninstalling |
+| `LRU_CACHE_LIB` | — | Path to `liblruexpert.so` if it is not beside the package |
+| `LRU_CACHE_POLICY` | `lru` | Victim rule: `lru` (recency) or `lfu` (frequency + decay) |
+| `LRU_CACHE_DECAY` | `64` | LFU only: halve counts every N steps |
+| `LRU_CACHE_CHUNKS` / `LRU_CACHE_LANES` | `16` / `64` | Gather kernel grid shape |
 
 ## How it works
 
@@ -87,6 +89,18 @@ graph-capturable as about hit rate.
 
 Both tensor-parallel ranks observe identical routing and the kernels use no atomics, so
 every rank's cache evolves identically with no cross-rank communication.
+
+## Does a smarter policy help?
+
+An LFU rule (frequency with decay) ships alongside the default LRU. Measured at 32 slots, the
+tightest budget where thrashing is worst, LFU came in at 36.7-39.0 tok/s against LRU's 39.4-39.6
+— no gain, slightly worse on average, and noisier. LRU stays the default.
+
+The reason is where the time goes: a miss costs roughly 50 us of PCIe for a ~1.3 MB expert while
+the entire manager kernel costs ~11 us. Choosing a better victim is nearly free but only shifts
+which transfers happen; it cannot make them cheaper. Cutting transfers outright — prefetching the
+next layer's experts during the current layer's compute, or giving more slots to layers whose
+routing is flatter — is the larger lever.
 
 ## Supported backends
 

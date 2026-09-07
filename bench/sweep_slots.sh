@@ -4,7 +4,7 @@
 #   MODEL=/models/qwen3-30b-a3b-w8a8 ./sweep_slots.sh 96 64 48 32
 #
 # Serves the model once per budget with the cache armed, warms it, then times a fixed
-# 200-token greedy completion. Compare against VLLM_LRU_DISABLE=1 for the read-through
+# 200-token greedy completion. Compare against LRU_CACHE_DISABLE=1 for the read-through
 # floor and a no-offload run for the fully-resident ceiling.
 set -uo pipefail
 MODEL=${MODEL:?set MODEL=/path/to/checkpoint}
@@ -14,7 +14,7 @@ PROMPT=${PROMPT:-"Write a detailed paragraph about the history of computing."}
 BUDGETS=("$@"); [ ${#BUDGETS[@]} -eq 0 ] && BUDGETS=(96 64 48 32)
 
 for S in "${BUDGETS[@]}"; do
-  VLLM_LRU_SLOTS=$S vllm serve "$MODEL" --port "$PORT" \
+  LRU_CACHE_SLOTS=$S vllm serve "$MODEL" --port "$PORT" \
     --tensor-parallel-size "${TP:-2}" --max-model-len "${LEN:-8192}" \
     --cpu-offload-gb "$OFFLOAD" --cpu-offload-params experts >/tmp/lru-$S.log 2>&1 &
   pid=$!

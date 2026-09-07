@@ -43,3 +43,30 @@ From `tests/test_policy.py` on one MI210:
 - `lru_gather`: 27.1 GB/s sustained — the PCIe Gen4 host-to-device roofline on this box
 - Policy correctness: matches an independent numpy LRU reference on every field, every step,
   across five routing patterns; gathered bytes are identical to their source rows.
+
+## Replacement policy: LRU vs LFU
+
+The kernel supports a second victim rule (`LRU_CACHE_POLICY=lfu`), which stores a per-slot hit
+count with periodic halving instead of a recency stamp. Measured at 32 slots — the tightest
+budget, where thrashing is worst and any policy gain should be largest:
+
+| Policy | Decode (tok/s), two runs |
+| --- | --- |
+| `lru` (default) | 39.4, 39.6 |
+| `lfu` (decay 64) | 36.7, 39.0 |
+
+**LFU did not beat LRU here.** It measured the same at best and slightly worse on average, with
+more run-to-run spread. Earlier simulation on a different model (DeepSeek-V4 routing traces) had
+LFU edging LRU by ~0.2 points of miss rate, so this is workload-dependent rather than a general
+result — but on Qwen3-30B-A3B there is nothing to gain by switching, and LRU stays the default.
+
+Worth noting where the real headroom is: a miss costs ~50 us of PCIe for a ~1.3 MB expert, while
+the whole manager kernel costs ~11 us. The policy decision is nearly free and the transfer is
+not, so reducing *transfers* (prefetching the next layer's experts during the current layer's
+compute) looks like a bigger lever than a better victim rule.
+
+## Verifying the cache is actually engaged
+
+Set `LRU_CACHE_DISABLE=1` with everything else unchanged. On this setup that drops decode from
+39.4 to 20.1 tok/s — the un-cached offload floor. Any measurement claiming a cache win should be
+able to show this control.
