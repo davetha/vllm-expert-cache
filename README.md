@@ -93,27 +93,30 @@ every rank's cache evolves identically with no cross-rank communication.
 
 ## Does a smarter policy help?
 
-Only when the cache is genuinely oversubscribed. An LFU rule (frequency with decay) ships
-alongside the default LRU; nine runs per cell, warm-up discarded:
+Unresolved -- and the attempt is instructive. An LFU rule (frequency with decay) ships alongside
+the default LRU, but repeated measurement could not establish a winner at 16 slots:
 
-| Slots | LRU | LFU |
+| Condition | LRU | LFU |
 | --- | --- | --- |
-| 32 | 40.75 tok/s | 40.79 tok/s (tie) |
-| 16 | 30.09 tok/s | **31.84 tok/s (+5.8%)** |
+| serve 1 | 30.09 | 31.84 |
+| serve 2, identical config | 31.20 | 30.13 |
 
-With 32 of 128 experts resident the working set mostly fits and the two policies keep the same
-experts, so the choice does not matter. At 16 the cache thrashes, and frequency beats recency:
-LRU discards a persistently-hot expert just because it missed one step, LFU keeps it. If you are
-running a tight budget, set `LRU_CACHE_POLICY=lfu`.
+Re-running the same configuration moves each policy by more than the gap between them, so
+between-serve variance (3-6%) dominates. LRU stays the default; do not expect a win from
+switching.
 
-Note the effect is small enough to be invisible to a casual benchmark: a two-run comparison of
-these same configurations reported the *opposite* conclusion before replication. Discard the
-first run and take at least five.
+Beware the measurement trap this exposes. Within one serve these numbers are tight to 0.02 tok/s
+across nine runs, which looks decisive and is not -- it measures one loaded process, not the
+configuration. Restart the server and the number moves 50x that. **Replicate across serves, not
+within one.** See `docs/results.md`.
 
-Even so, the policy only reorders which transfers happen. A miss costs ~50 us of PCIe for a
-~1.3 MB expert against ~11 us for the entire manager kernel, so cutting transfers outright --
+The budget curve above is unaffected: those differences are 5-10 tok/s against ~1.5 tok/s of serve
+noise, as is the cache-on/off control at 20 tok/s.
+
+Regardless of policy, the victim rule only reorders which transfers happen. A miss costs ~50 us of
+PCIe for a ~1.3 MB expert against ~11 us for the whole manager kernel, so cutting transfers --
 prefetching the next layer's experts during the current layer's compute, or giving more slots to
-layers with flatter routing -- remains the larger lever.
+layers with flatter routing -- is the larger lever.
 
 ## Supported backends
 

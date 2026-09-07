@@ -45,33 +45,50 @@ From `tests/test_policy.py` on one MI210:
 - Policy correctness: matches an independent numpy LRU reference on every field, every step,
   across five routing patterns; gathered bytes are identical to their source rows.
 
-## Replacement policy: LRU vs LFU
+## Replacement policy: LRU vs LFU -- INCONCLUSIVE
 
 The kernel supports a second victim rule (`LRU_CACHE_POLICY=lfu`), storing a per-slot hit count
-with periodic halving instead of a recency stamp.
+with periodic halving instead of a recency stamp. **Whether it beats LRU is unresolved**, and the
+measurements below are recorded mainly as a warning about how to measure this.
 
-**The policy matters, but only when the cache is genuinely oversubscribed.** Nine runs per cell
-in a single serve, first discarded as warm-up:
+Each cell is one serve, 6-9 timed 200-token decodes, warm-up discarded, 16 slots:
 
-| Slots | LRU (mean, range) | LFU (mean, range) | LFU vs LRU |
+| Condition | LRU | LFU | Apparent winner |
 | --- | --- | --- | --- |
-| 32 | 40.75 (40.73-40.76) | 40.79 (40.40-40.95) | +0.1% -- a tie, ranges overlap |
-| 16 | 30.09 (30.08-30.10) | **31.84** (31.78-31.93) | **+5.8% -- ranges do not overlap** |
+| serve 1 | 30.09 | 31.84 | LFU by 5.8% |
+| serve 2 (identical config) | 31.20 | 30.13 | LRU by 3.6% |
+| throttled gather (c=2, l=8) | 27.48 | 26.68 | LRU by 3.0% |
 
-At 32 slots the working set largely fits, both policies hold the same experts, and the choice is
-irrelevant. At 16 the cache is genuinely oversubscribed and frequency wins: LRU will evict a
-persistently-hot expert merely because it went untouched for a step, while LFU protects it.
+The sign is not stable. Re-running the *same* configuration moved LRU by 1.11 tok/s and LFU by
+1.71 tok/s, so between-serve variance is 3-6% -- larger than any policy effect being claimed.
+Pooled, LRU averages 30.65 and LFU 30.99, a gap well inside that noise. There is no evidence
+either policy is better at this budget. LRU remains the default.
 
-### A methodology warning
+### The methodology trap
 
-An earlier two-samples-per-cell version of this comparison concluded the opposite -- that LFU was
-no better and possibly worse. It was simply underpowered. Run-to-run scatter in the unsettled
-first samples (~1.3 tok/s) swamped a real 1.75 tok/s effect and inverted the sign of the answer.
-With nine runs the within-policy spread collapses to 0.02-0.15 tok/s and the separation at 16
-slots is unambiguous.
+Within a single serve these measurements are extraordinarily tight: spreads of 0.02-0.15 tok/s
+across nine runs. That precision is real but it answers the wrong question -- it is the
+repeatability of one loaded process, not the reproducibility of a configuration. Restart the
+server and the number moves by 50x that spread.
 
-Two samples cannot resolve a few-percent effect here. Discard the first run (the cache is still
-filling: 28.1 vs a 30.1 steady state) and take at least five more.
+This burned two successive conclusions here. A two-run comparison said LFU was worse; a
+nine-run-single-serve comparison said LFU was 5.8% better and called it decisive because the
+ranges were disjoint. Both were artefacts. **The unit of replication has to be the serve.**
+
+To actually resolve an effect this size, either run 5+ independent serves per arm and compare
+serve means, or make the policy switchable at runtime so both arms can be interleaved inside one
+process, which removes the between-serve term entirely. The latter is the cheaper experiment and
+is not yet implemented.
+
+The same caveat applies to the throttled-gather run, so it does **not** answer whether a slower
+link would favour one policy: that comparison carries the identical confound.
+
+### What this does not undermine
+
+The slot-budget curve is unaffected. Differences between budgets are 5-10 tok/s -- several times
+the ~1.5 tok/s serve noise -- so the shape is solid even though each individual point carries that
+uncertainty. (Consistently, 32 slots measured 39.4 in one serve and 40.75 in another.) The same
+holds for the cache-on vs cache-off control, which is a 20 tok/s effect.
 
 ## Verifying the cache is actually engaged
 
