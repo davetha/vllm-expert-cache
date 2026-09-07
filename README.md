@@ -93,20 +93,27 @@ every rank's cache evolves identically with no cross-rank communication.
 
 ## Does a smarter policy help?
 
-An LFU rule (frequency with decay) ships alongside the default LRU. It does not help. At 32
-slots LFU measured 36.7-39.0 tok/s against LRU's 39.4-39.6; at 16 slots, where turnover is most
-severe, 30.3-31.6 against 30.8-30.7. Both are ties within run-to-run noise, so the result is not
-budget-dependent — tightening the cache does not open a gap. LRU stays the default.
+Only when the cache is genuinely oversubscribed. An LFU rule (frequency with decay) ships
+alongside the default LRU; nine runs per cell, warm-up discarded:
 
-Part of the reason is that reuse is highly concentrated: 16 resident experts out of 128, with 8
-routed per step, still delivers 1.6x the un-cached floor. When the same experts keep coming back
-that hard, recency and frequency pick nearly the same victims.
+| Slots | LRU | LFU |
+| --- | --- | --- |
+| 32 | 40.75 tok/s | 40.79 tok/s (tie) |
+| 16 | 30.09 tok/s | **31.84 tok/s (+5.8%)** |
 
-The rest of the reason is where the time goes: a miss costs roughly 50 us of PCIe for a ~1.3 MB expert while
-the entire manager kernel costs ~11 us. Choosing a better victim is nearly free but only shifts
-which transfers happen; it cannot make them cheaper. Cutting transfers outright — prefetching the
-next layer's experts during the current layer's compute, or giving more slots to layers whose
-routing is flatter — is the larger lever.
+With 32 of 128 experts resident the working set mostly fits and the two policies keep the same
+experts, so the choice does not matter. At 16 the cache thrashes, and frequency beats recency:
+LRU discards a persistently-hot expert just because it missed one step, LFU keeps it. If you are
+running a tight budget, set `LRU_CACHE_POLICY=lfu`.
+
+Note the effect is small enough to be invisible to a casual benchmark: a two-run comparison of
+these same configurations reported the *opposite* conclusion before replication. Discard the
+first run and take at least five.
+
+Even so, the policy only reorders which transfers happen. A miss costs ~50 us of PCIe for a
+~1.3 MB expert against ~11 us for the entire manager kernel, so cutting transfers outright --
+prefetching the next layer's experts during the current layer's compute, or giving more slots to
+layers with flatter routing -- remains the larger lever.
 
 ## Supported backends
 

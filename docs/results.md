@@ -47,35 +47,31 @@ From `tests/test_policy.py` on one MI210:
 
 ## Replacement policy: LRU vs LFU
 
-The kernel supports a second victim rule (`LRU_CACHE_POLICY=lfu`), which stores a per-slot hit
-count with periodic halving instead of a recency stamp. Measured at 32 slots — the tightest
-budget, where thrashing is worst and any policy gain should be largest:
+The kernel supports a second victim rule (`LRU_CACHE_POLICY=lfu`), storing a per-slot hit count
+with periodic halving instead of a recency stamp.
 
-| Policy | Decode (tok/s), two runs |
-| --- | --- |
-| `lru` (default) | 39.4, 39.6 |
-| `lfu` (decay 64) | 36.7, 39.0 |
+**The policy matters, but only when the cache is genuinely oversubscribed.** Nine runs per cell
+in a single serve, first discarded as warm-up:
 
-Repeated at 16 slots, where each decode step needs 8 experts out of only 16 resident and
-turnover is at its most severe:
+| Slots | LRU (mean, range) | LFU (mean, range) | LFU vs LRU |
+| --- | --- | --- | --- |
+| 32 | 40.75 (40.73-40.76) | 40.79 (40.40-40.95) | +0.1% -- a tie, ranges overlap |
+| 16 | 30.09 (30.08-30.10) | **31.84** (31.78-31.93) | **+5.8% -- ranges do not overlap** |
 
-| Policy | Decode (tok/s), two runs |
-| --- | --- |
-| `lru` (default) | 30.8, 30.7 |
-| `lfu` (decay 64) | 30.3, 31.6 |
+At 32 slots the working set largely fits, both policies hold the same experts, and the choice is
+irrelevant. At 16 the cache is genuinely oversubscribed and frequency wins: LRU will evict a
+persistently-hot expert merely because it went untouched for a step, while LFU protects it.
 
-**LFU did not beat LRU at either budget.** At 16 slots the two are indistinguishable (LFU's
-own run-to-run spread, 30.3-31.6, is wider than the gap between the policies), so the verdict
-is not budget-dependent: tightening the cache does not create an opening for a smarter victim
-rule. It measured the same at best and slightly worse on average, with
-more run-to-run spread. Earlier simulation on a different model (DeepSeek-V4 routing traces) had
-LFU edging LRU by ~0.2 points of miss rate, so this is workload-dependent rather than a general
-result — but on Qwen3-30B-A3B there is nothing to gain by switching, and LRU stays the default.
+### A methodology warning
 
-Worth noting where the real headroom is: a miss costs ~50 us of PCIe for a ~1.3 MB expert, while
-the whole manager kernel costs ~11 us. The policy decision is nearly free and the transfer is
-not, so reducing *transfers* (prefetching the next layer's experts during the current layer's
-compute) looks like a bigger lever than a better victim rule.
+An earlier two-samples-per-cell version of this comparison concluded the opposite -- that LFU was
+no better and possibly worse. It was simply underpowered. Run-to-run scatter in the unsettled
+first samples (~1.3 tok/s) swamped a real 1.75 tok/s effect and inverted the sign of the answer.
+With nine runs the within-policy spread collapses to 0.02-0.15 tok/s and the separation at 16
+slots is unambiguous.
+
+Two samples cannot resolve a few-percent effect here. Discard the first run (the cache is still
+filling: 28.1 vs a 30.1 steady state) and take at least five more.
 
 ## Verifying the cache is actually engaged
 
