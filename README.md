@@ -21,6 +21,7 @@ single-stream greedy decode:
 | 64 | 54.3 tok/s | 83% |
 | 48 | 49.3 tok/s | 75% |
 | 32 | 39.4 tok/s | 60% |
+| 16 | 30.8 tok/s | 47% |
 | 0 (offload, no cache) | 19.1 tok/s | 29% |
 
 Half the experts resident holds **83% of full speed**; a quarter still holds **60%**, and
@@ -92,11 +93,16 @@ every rank's cache evolves identically with no cross-rank communication.
 
 ## Does a smarter policy help?
 
-An LFU rule (frequency with decay) ships alongside the default LRU. Measured at 32 slots, the
-tightest budget where thrashing is worst, LFU came in at 36.7-39.0 tok/s against LRU's 39.4-39.6
-— no gain, slightly worse on average, and noisier. LRU stays the default.
+An LFU rule (frequency with decay) ships alongside the default LRU. It does not help. At 32
+slots LFU measured 36.7-39.0 tok/s against LRU's 39.4-39.6; at 16 slots, where turnover is most
+severe, 30.3-31.6 against 30.8-30.7. Both are ties within run-to-run noise, so the result is not
+budget-dependent — tightening the cache does not open a gap. LRU stays the default.
 
-The reason is where the time goes: a miss costs roughly 50 us of PCIe for a ~1.3 MB expert while
+Part of the reason is that reuse is highly concentrated: 16 resident experts out of 128, with 8
+routed per step, still delivers 1.6x the un-cached floor. When the same experts keep coming back
+that hard, recency and frequency pick nearly the same victims.
+
+The rest of the reason is where the time goes: a miss costs roughly 50 us of PCIe for a ~1.3 MB expert while
 the entire manager kernel costs ~11 us. Choosing a better victim is nearly free but only shifts
 which transfers happen; it cannot make them cheaper. Cutting transfers outright — prefetching the
 next layer's experts during the current layer's compute, or giving more slots to layers whose

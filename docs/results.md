@@ -20,6 +20,7 @@
 | 64 | 54.3 | 83% |
 | 48 | 49.3 | 75% |
 | 32 | 39.4 | 60% |
+| 16 | 30.8 | 47% |
 | 0 (offload, cache disabled) | 19.1 | 29% |
 
 Returns diminish as the budget grows: the first 32 slots roughly double throughput over the
@@ -55,7 +56,18 @@ budget, where thrashing is worst and any policy gain should be largest:
 | `lru` (default) | 39.4, 39.6 |
 | `lfu` (decay 64) | 36.7, 39.0 |
 
-**LFU did not beat LRU here.** It measured the same at best and slightly worse on average, with
+Repeated at 16 slots, where each decode step needs 8 experts out of only 16 resident and
+turnover is at its most severe:
+
+| Policy | Decode (tok/s), two runs |
+| --- | --- |
+| `lru` (default) | 30.8, 30.7 |
+| `lfu` (decay 64) | 30.3, 31.6 |
+
+**LFU did not beat LRU at either budget.** At 16 slots the two are indistinguishable (LFU's
+own run-to-run spread, 30.3-31.6, is wider than the gap between the policies), so the verdict
+is not budget-dependent: tightening the cache does not create an opening for a smarter victim
+rule. It measured the same at best and slightly worse on average, with
 more run-to-run spread. Earlier simulation on a different model (DeepSeek-V4 routing traces) had
 LFU edging LRU by ~0.2 points of miss rate, so this is workload-dependent rather than a general
 result — but on Qwen3-30B-A3B there is nothing to gain by switching, and LRU stays the default.
@@ -70,3 +82,13 @@ compute) looks like a bigger lever than a better victim rule.
 Set `LRU_CACHE_DISABLE=1` with everything else unchanged. On this setup that drops decode from
 39.4 to 20.1 tok/s — the un-cached offload floor. Any measurement claiming a cache win should be
 able to show this control.
+
+## Locality is stronger than expected
+
+16 slots is 1/8 of the experts, and each decode step routes 8 of them -- so on paper the cache
+should turn over almost completely every step and collapse toward read-through. It does not:
+30.8 tok/s is still **1.6x the un-cached floor** and 47% of fully resident.
+
+That only works if consecutive tokens keep landing on overlapping experts. It is the same
+property that makes the whole cache work, and it is why the victim rule barely matters: when
+the reuse is that concentrated, recency and frequency identify nearly the same set.
