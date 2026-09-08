@@ -18,12 +18,15 @@ __version__ = "0.1.0"
 
 def install() -> None:
     """Patch every supported MoE quantisation backend. Called by vLLM at startup."""
+    # Name the logger inside vLLM's own tree. vLLM only attaches handlers to "vllm.*",
+    # so a logger named anything else emits nothing in a real server and the plugin looks
+    # inert even while it is working.
     try:
         from vllm.logger import init_logger
-        logger = init_logger("vllm_expert_cache")
+        logger = init_logger("vllm.expert_cache")
     except Exception:  # pragma: no cover - vLLM always provides this in practice
         import logging
-        logger = logging.getLogger("vllm_expert_cache")
+        logger = logging.getLogger("vllm.expert_cache")
 
     if settings.disabled:
         logger.info("expert-cache: disabled by EXPERT_CACHE_DISABLE")

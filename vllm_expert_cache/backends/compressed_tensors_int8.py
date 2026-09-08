@@ -20,6 +20,7 @@ from ..config import settings
 SOURCES = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
 
 _installed = False
+_announced = False
 
 
 def install(logger) -> bool:
@@ -70,16 +71,22 @@ def install(logger) -> bool:
             device = torch.device("cuda", torch.cuda.current_device())
             cache = ExpertSlotCache(layer, SOURCES, num_experts, slots, device)
             layer._lru_slot_kernel = _build_slot_kernel(self, layer, cache)
-            layer._lru_cache = cache
-            logger.info("expert-cache: armed layer with %d/%d experts resident",
-                        slots, num_experts)
+            layer._expert_cache = cache
+            global _announced
+            if not _announced:
+                logger.info(
+                    "expert-cache: %d/%d experts resident per layer, policy=%s "
+                    "(EXPERT_CACHE_SLOTS / EXPERT_CACHE_POLICY to change, "
+                    "EXPERT_CACHE_DISABLE=1 to turn off)",
+                    slots, num_experts, settings.policy)
+                _announced = True
         except Exception as e:
             # Never break serving: without a cache the layer just reads through as before.
             logger.warning("expert-cache: disabled for layer (%r)", e)
-            layer._lru_cache = None
+            layer._expert_cache = None
 
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
-        cache = getattr(layer, "_lru_cache", None)
+        cache = getattr(layer, "_expert_cache", None)
         if cache is None or not cache.fits(topk_ids):
             # Wide / prefill steps touch more distinct experts than there are slots;
             # those read through the host copies on the stock path.
