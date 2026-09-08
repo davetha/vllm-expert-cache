@@ -1,4 +1,4 @@
-"""Device-side LRU expert cache for vLLM MoE models.
+"""Device-side expert cache for vLLM MoE models.
 
 Keeps a bounded set of experts resident in VRAM and streams the rest from host memory,
 so a mixture-of-experts model that does not fit on the GPU still decodes at close to
@@ -13,11 +13,11 @@ from __future__ import annotations
 from .config import settings
 
 __all__ = ["install", "settings"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def install() -> None:
-    """Patch every supported MoE quantisation backend. Called by vLLM at startup."""
+    """Arm the cache for whatever MoE quantisation the model turns out to use."""
     # Name the logger inside vLLM's own tree. vLLM only attaches handlers to "vllm.*",
     # so a logger named anything else emits nothing in a real server and the plugin looks
     # inert even while it is working.
@@ -32,11 +32,7 @@ def install() -> None:
         logger.info("expert-cache: disabled by EXPERT_CACHE_DISABLE")
         return
 
-    from .backends import compressed_tensors_int8
+    from .backends import generic
 
-    armed = [name for name, mod in (("compressed-tensors int8", compressed_tensors_int8),)
-             if mod.install(logger)]
-    if armed:
-        logger.info("expert-cache %s active for: %s", __version__, ", ".join(armed))
-    else:
-        logger.info("expert-cache: no supported MoE backend found; staying out of the way")
+    if not generic.install(logger):
+        logger.info("expert-cache: could not hook vLLM's MoE loader; staying out of the way")
