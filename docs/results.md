@@ -88,10 +88,17 @@ weakest case.
 
 ### Recommendation
 
-Prefer `LRU_CACHE_POLICY=lfu` when the budget is tight or the link is slow. LRU remains the
-default only because it is the policy with a bit-exact reference test (`tests/test_policy.py`
-validates policy 0 against a numpy model on every field of every step); LFU has no equivalent
-yet. Writing that reference is the obvious next step before promoting LFU to the default.
+**LFU is the default.** The reference model in `tests/test_policy.py` now covers both victim
+rules -- run it with `POLICY=0` or `POLICY=1` and either matches an independent numpy
+implementation on every field of every step -- so the verification gap that kept LRU in front is
+closed. Fewer misses at every budget on both workloads, equally verified, so it wins on the
+evidence. `LRU_CACHE_POLICY=lru` restores the old behaviour.
+
+Modelling LFU exactly requires one subtlety worth knowing if you touch the kernel: it returns as
+soon as it knows there is nothing to insert, so a step with no misses never reaches the aging
+pass. A reference that decays on every step drifts out of agreement within a few dozen steps.
+
+`LRU_CACHE_DECAY` (default 64) is untuned -- a round number, never swept.
 
 ## Verifying the cache is actually engaged
 

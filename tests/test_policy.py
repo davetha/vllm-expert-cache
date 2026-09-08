@@ -80,8 +80,15 @@ class State:
         self.cap = cap
 
 
-def ref_step(s, ids, max_distinct, max_inserts):
-    """Independent numpy model of lru_manage_k. Returns the expected miss list."""
+def ref_step(s, ids, max_distinct, max_inserts, policy=None, decay=None):
+    """Independent numpy model of lru_manage_k. Returns the expected miss list.
+
+    Models both victim rules. The per-slot priority is a recency stamp under LRU and a
+    hit count under LFU; everything else -- scan order, the never-evict-what-this-step-
+    needs rule, the (priority, slot) tie-break -- is shared.
+    """
+    policy = POLICY if policy is None else policy
+    decay = DECAY if decay is None else decay
     s.r_step += 1
     routed = np.unique(ids[ids >= 0])
     if len(routed) > max_distinct:
@@ -90,10 +97,21 @@ def ref_step(s, ids, max_distinct, max_inserts):
     for e in routed:                       # ascending expert id == the kernel's scan order
         sl = s.r_table[e]
         if sl >= 0:
-            s.r_st[sl] = s.r_step
+            # LRU records when it was last routed; LFU counts how often.
+            if policy == 0:
+                s.r_st[sl] = s.r_step
+            else:
+                s.r_st[sl] += 1
         else:
             misses.append(int(e))
     misses = misses[:max_inserts]
+    # The kernel returns as soon as it knows there is nothing to insert, so a step with
+    # no misses never reaches the aging pass. Mirror that or the counts drift apart.
+    if not misses:
+        return []
+    if policy != 0 and decay > 0 and (s.r_step % decay) == 0:
+        for i in range(s.S):
+            s.r_st[i] = int(s.r_st[i]) >> 1
     rset = set(routed.tolist())
     out = []
     for e in misses:
@@ -106,7 +124,8 @@ def ref_step(s, ids, max_distinct, max_inserts):
             s.r_table[old] = -1
             s.r_cold[old] = old
         s.r_se[sl] = e
-        s.r_st[sl] = s.r_step
+        # A fresh expert starts at the current step under LRU, at a count of 1 under LFU.
+        s.r_st[sl] = s.r_step if policy == 0 else 1
         s.r_table[e] = sl
         s.r_cold[e] = -1
         out.append((e, sl))

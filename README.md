@@ -55,7 +55,7 @@ LRU_CACHE_SLOTS=64 vllm serve <model> \
 | `LRU_CACHE_FRACTION` | `0.5` | Used when `LRU_CACHE_SLOTS` is unset: fraction of experts to keep |
 | `LRU_CACHE_DISABLE` | `0` | `1` turns the cache off without uninstalling |
 | `LRU_CACHE_LIB` | — | Path to `liblruexpert.so` if it is not beside the package |
-| `LRU_CACHE_POLICY` | `lru` | Victim rule: `lru` (recency) or `lfu` (frequency + decay) |
+| `LRU_CACHE_POLICY` | `lfu` | Victim rule: `lfu` (frequency + decay) or `lru` (recency) |
 | `LRU_CACHE_DECAY` | `64` | LFU only: halve counts every N steps |
 | `LRU_CACHE_CHUNKS` / `LRU_CACHE_LANES` | `16` / `64` | Gather kernel grid shape |
 
@@ -106,9 +106,13 @@ End-to-end that is worth only 1-2% here (4 concurrent streams: LRU 50.6/50.7 vs 
 tok/s across two serves), because PCIe transfers are a fraction of decode time at these budgets.
 On a slower link, where each avoided transfer is worth more, expect the gap to widen.
 
-Set `LRU_CACHE_POLICY=lfu` if your budget is tight or your bus is slow. LRU stays the default only
-because it is the policy covered by the bit-exact reference test; giving LFU the same treatment is
-the prerequisite for promoting it.
+**LFU is the default.** Both rules are now validated bit-exactly against the reference model
+(`tests/test_policy.py` checks either policy against an independent numpy implementation on every
+field of every step), so there is no verification argument left for keeping the weaker one. Set
+`LRU_CACHE_POLICY=lru` to go back.
+
+The decay period (`LRU_CACHE_DECAY`, default 64 steps) is untuned -- it was picked as a round
+number and never swept. If you care about the last few percent, that is the knob to explore.
 
 **Measure misses, not tokens.** Between-serve throughput variance here is 3-6% while the policy
 effect is 1-2%, so timing tokens produces sign flips rather than answers -- it did exactly that to
