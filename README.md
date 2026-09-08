@@ -196,11 +196,25 @@ Two traps worth knowing before you write one:
 
 ## Hardware
 
-Built and validated on CDNA2 (gfx90a). The kernels use only block-level LDS reductions and
-`__syncthreads()` — no warp-width intrinsics — so the same source builds for wave64 (CDNA) and
-wave32 (RDNA) unchanged. `build.sh` takes several architectures at once for a fat binary.
+Any AMD GPU with ROCm. The kernels use only block-level LDS reductions and `__syncthreads()` —
+no warp-width intrinsics — so one source serves both wavefront widths:
 
-CUDA support needs the HIP kernels ported; the Python side is device-agnostic.
+| Target | | Status |
+| --- | --- | --- |
+| `gfx90a` | CDNA2, MI210/MI250 | builds; full test suite and serving validated here |
+| `gfx1201` | RDNA4, R9700 | builds; this kernel's original home, run in production there |
+| `gfx942` | CDNA3, MI300 | builds; not yet exercised on hardware |
+
+```bash
+kernels/build.sh gfx90a gfx942 gfx1201    # one fat binary for all three
+```
+
+Nothing in the Python layer is device-specific. NVIDIA support needs the HIP kernels ported —
+they are plain HIP with no AMD matrix intrinsics, so the port is mechanical, but it has not been
+done.
+
+Note that the limiting factor is the quantisation backend, not the GPU: this currently wires up
+compressed-tensors W8A8 int8 and nothing else. See [Supported backends](#supported-backends).
 
 ---
 
