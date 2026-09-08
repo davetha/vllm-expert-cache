@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Build liblruexpert.so for one or more GPU architectures.
+# Build libexpertcache.so for one or more GPU architectures.
 #
 #   ./build.sh                 # defaults to gfx90a
 #   ./build.sh gfx942          # MI300
 #   ./build.sh gfx90a gfx1201  # fat binary for CDNA2 + RDNA4
 #
 # The kernels use only block-level LDS reductions, so one source serves wave64 and wave32.
-# Drop the result next to the Python package (vllm_lru_cache/) or point LRU_CACHE_LIB at it.
+# Drop the result next to the Python package (vllm_expert_cache/) or point EXPERT_CACHE_LIB at it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCHS=("$@"); [ ${#ARCHS[@]} -eq 0 ] && ARCHS=(gfx90a)
-OUT=${OUT:-../vllm_lru_cache/liblruexpert.so}
+OUT=${OUT:-../vllm_expert_cache/libexpertcache.so}
 
 # hipcc lives in a system ROCm install, or in the ROCm pip wheels some images ship.
 HIPCC=${HIPCC:-}
@@ -31,9 +31,9 @@ DEVLIB=$(ls -d /opt/python/lib/python*/site-packages/_rocm_sdk_core/lib/llvm/amd
 [ -n "$DEVLIB" ] && FLAGS+=(--rocm-device-lib-path="$DEVLIB")
 
 echo "building for: ${ARCHS[*]}"
-"$HIPCC" "${FLAGS[@]}" lru_expert_cache.hip -o "$OUT"
+"$HIPCC" "${FLAGS[@]}" expert_cache.hip -o "$OUT"
 
-for sym in lru_manage lru_gather lru_fused; do
+for sym in expert_cache_manage expert_cache_gather expert_cache_fused; do
   nm -D "$OUT" | grep -q " T $sym$" || { echo "MISSING EXPORT: $sym" >&2; exit 1; }
 done
 echo "built $OUT"; ls -l "$OUT"

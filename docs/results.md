@@ -40,8 +40,8 @@ near the eager number while the LRU captures and reaches 54.3.
 
 From `tests/test_policy.py` on one MI210:
 
-- `lru_manage`: ~11.3 us per layer-step at steady state
-- `lru_gather`: 27.1 GB/s sustained — the PCIe Gen4 host-to-device roofline on this box
+- `expert_cache_manage`: ~11.3 us per layer-step at steady state
+- `expert_cache_gather`: 27.1 GB/s sustained — the PCIe Gen4 host-to-device roofline on this box
 - Policy correctness: matches an independent numpy LRU reference on every field, every step,
   across five routing patterns; gathered bytes are identical to their source rows.
 
@@ -92,17 +92,17 @@ weakest case.
 rules -- run it with `POLICY=0` or `POLICY=1` and either matches an independent numpy
 implementation on every field of every step -- so the verification gap that kept LRU in front is
 closed. Fewer misses at every budget on both workloads, equally verified, so it wins on the
-evidence. `LRU_CACHE_POLICY=lru` restores the old behaviour.
+evidence. `EXPERT_CACHE_POLICY=lru` restores the old behaviour.
 
 Modelling LFU exactly requires one subtlety worth knowing if you touch the kernel: it returns as
 soon as it knows there is nothing to insert, so a step with no misses never reaches the aging
 pass. A reference that decays on every step drifts out of agreement within a few dozen steps.
 
-`LRU_CACHE_DECAY` (default 64) is untuned -- a round number, never swept.
+`EXPERT_CACHE_DECAY` (default 64) is untuned -- a round number, never swept.
 
 ## Verifying the cache is actually engaged
 
-Set `LRU_CACHE_DISABLE=1` with everything else unchanged. On this setup that drops decode from
+Set `EXPERT_CACHE_DISABLE=1` with everything else unchanged. On this setup that drops decode from
 39.4 to 20.1 tok/s — the un-cached offload floor. Any measurement claiming a cache win should be
 able to show this control.
 

@@ -4,9 +4,9 @@ The model's full expert tensors stay where the offloader put them -- host RAM, m
 the GPU can read them. This class adds a small set of VRAM *slots* and an LRU that decides
 which experts occupy them. Each forward:
 
-  1. `lru_manage` marks the experts routed this step, refreshes their stamps, evicts the
+  1. `expert_cache_manage` marks the experts routed this step, refreshes their stamps, evicts the
      least-recently-routed slots that this step does NOT need, and emits a miss list.
-  2. `lru_gather` pulls each missing expert's rows from host memory into its new slot.
+  2. `expert_cache_gather` pulls each missing expert's rows from host memory into its new slot.
   3. The routing ids are remapped expert -> slot, and the stock fused-MoE kernel runs
      against the slot buffers.
 
@@ -61,8 +61,8 @@ class ExpertSlotCache:
 
         self.policy = settings.policy_code
         self.decay = settings.decay
-        self.chunks = int(os.environ.get("LRU_CACHE_CHUNKS", "16"))
-        self.lanes = int(os.environ.get("LRU_CACHE_LANES", "64"))
+        self.chunks = int(os.environ.get("EXPERT_CACHE_CHUNKS", "16"))
+        self.lanes = int(os.environ.get("EXPERT_CACHE_LANES", "64"))
 
     def fits(self, topk_ids: torch.Tensor) -> bool:
         """Can this step be served entirely from slots?
@@ -83,7 +83,7 @@ class ExpertSlotCache:
         stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
         ids = topk_ids.to(torch.int32).contiguous()
 
-        rc = h.lru_manage(
+        rc = h.expert_cache_manage(
             ctypes.c_void_p(ids.data_ptr()), int(ids.numel()), self.E, self.S,
             min(self.E, int(ids.numel())), self.S,
             ctypes.c_void_p(self.table.data_ptr()),
@@ -98,7 +98,7 @@ class ExpertSlotCache:
             stream,
         )
         if rc != 0:
-            raise RuntimeError(f"lru_manage failed rc={rc}")
+            raise RuntimeError(f"expert_cache_manage failed rc={rc}")
 
         dsts, srcs = [], []
         for n in self.names:
@@ -114,13 +114,13 @@ class ExpertSlotCache:
         for d, s in zip(dsts, srcs):
             args += [ctypes.c_void_p(d.data_ptr()), ctypes.c_void_p(s.data_ptr()),
                      ctypes.c_long(_bytes_per_expert(s))]
-        rc = h.lru_gather(
+        rc = h.expert_cache_gather(
             *args,
             ctypes.c_void_p(self.miss.data_ptr()),
             ctypes.c_void_p(self.n_miss.data_ptr()),
             self.chunks, self.lanes, stream,
         )
         if rc != 0:
-            raise RuntimeError(f"lru_gather failed rc={rc} (slab sizes must be 16B multiples)")
+            raise RuntimeError(f"expert_cache_gather failed rc={rc} (slab sizes must be 16B multiples)")
 
         return self.remap(topk_ids)

@@ -5,7 +5,7 @@ so a mixture-of-experts model that does not fit on the GPU still decodes at clos
 fully-resident speed.
 
 vLLM loads this automatically through the `vllm.general_plugins` entry point; installing
-the package is enough. Set `LRU_CACHE_DISABLE=1` to turn it off without uninstalling.
+the package is enough. Set `EXPERT_CACHE_DISABLE=1` to turn it off without uninstalling.
 """
 
 from __future__ import annotations
@@ -20,13 +20,13 @@ def install() -> None:
     """Patch every supported MoE quantisation backend. Called by vLLM at startup."""
     try:
         from vllm.logger import init_logger
-        logger = init_logger("vllm_lru_cache")
+        logger = init_logger("vllm_expert_cache")
     except Exception:  # pragma: no cover - vLLM always provides this in practice
         import logging
-        logger = logging.getLogger("vllm_lru_cache")
+        logger = logging.getLogger("vllm_expert_cache")
 
     if settings.disabled:
-        logger.info("lru-expert-cache: disabled by LRU_CACHE_DISABLE")
+        logger.info("expert-cache: disabled by EXPERT_CACHE_DISABLE")
         return
 
     from .backends import compressed_tensors_int8
@@ -34,6 +34,6 @@ def install() -> None:
     armed = [name for name, mod in (("compressed-tensors int8", compressed_tensors_int8),)
              if mod.install(logger)]
     if armed:
-        logger.info("lru-expert-cache %s active for: %s", __version__, ", ".join(armed))
+        logger.info("expert-cache %s active for: %s", __version__, ", ".join(armed))
     else:
-        logger.info("lru-expert-cache: no supported MoE backend found; staying out of the way")
+        logger.info("expert-cache: no supported MoE backend found; staying out of the way")

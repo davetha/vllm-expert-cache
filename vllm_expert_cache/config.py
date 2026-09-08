@@ -8,18 +8,18 @@ import os
 class _Settings:
     @property
     def disabled(self) -> bool:
-        return os.environ.get("LRU_CACHE_DISABLE", "0") == "1"
+        return os.environ.get("EXPERT_CACHE_DISABLE", "0") == "1"
 
     @property
     def slots(self) -> int | None:
         """Absolute slot count, if set."""
-        v = os.environ.get("LRU_CACHE_SLOTS")
+        v = os.environ.get("EXPERT_CACHE_SLOTS")
         return int(v) if v else None
 
     @property
     def fraction(self) -> float:
-        """Fraction of experts to keep resident when LRU_CACHE_SLOTS is unset."""
-        return float(os.environ.get("LRU_CACHE_FRACTION", "0.5"))
+        """Fraction of experts to keep resident when EXPERT_CACHE_SLOTS is unset."""
+        return float(os.environ.get("EXPERT_CACHE_FRACTION", "0.5"))
 
     @property
     def policy(self) -> str:
@@ -28,7 +28,7 @@ class _Settings:
         LFU fetches 11-26% fewer experts across budgets and workloads; both rules are
         validated bit-exactly against the reference model in tests/test_policy.py.
         """
-        return os.environ.get("LRU_CACHE_POLICY", "lfu").strip().lower()
+        return os.environ.get("EXPERT_CACHE_POLICY", "lfu").strip().lower()
 
     @property
     def policy_code(self) -> int:
@@ -37,7 +37,7 @@ class _Settings:
     @property
     def decay(self) -> int:
         """LFU only: halve every N steps so stale-hot experts age out. 0 disables."""
-        return int(os.environ.get("LRU_CACHE_DECAY", "64"))
+        return int(os.environ.get("EXPERT_CACHE_DECAY", "64"))
 
     def slots_for(self, num_experts: int) -> int:
         n = self.slots if self.slots is not None else round(num_experts * self.fraction)

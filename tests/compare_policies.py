@@ -7,10 +7,10 @@ import ctypes, os, sys
 import numpy as np
 import torch
 
-LIB = os.environ.get("LRU_CACHE_LIB", "/repo/vllm_lru_cache/liblruexpert.so")
+LIB = os.environ.get("EXPERT_CACHE_LIB", "/repo/vllm_expert_cache/libexpertcache.so")
 lib = ctypes.CDLL(LIB)
-lib.lru_manage.restype = ctypes.c_int
-lib.lru_manage.argtypes = ([ctypes.c_void_p] + [ctypes.c_int] * 5
+lib.expert_cache_manage.restype = ctypes.c_int
+lib.expert_cache_manage.argtypes = ([ctypes.c_void_p] + [ctypes.c_int] * 5
                            + [ctypes.c_void_p] * 8 + [ctypes.c_int] * 2 + [ctypes.c_void_p])
 DEV = "cuda:0"
 
@@ -33,7 +33,7 @@ def run(trace, E, S, policy, decay=64):
     total = 0
     for ids in trace:
         t = torch.tensor(ids, dtype=torch.int32, device=DEV)
-        rc = lib.lru_manage(
+        rc = lib.expert_cache_manage(
             ctypes.c_void_p(t.data_ptr()), t.numel(), E, S,
             min(E, t.numel()), S,
             ctypes.c_void_p(s.table.data_ptr()), ctypes.c_void_p(s.map_cold.data_ptr()),

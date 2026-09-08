@@ -32,7 +32,7 @@ def install(logger) -> bool:
             make_int8_moe_kernel,
         )
     except Exception as e:
-        logger.debug("lru-expert-cache: int8 MoE backend unavailable (%r)", e)
+        logger.debug("expert-cache: int8 MoE backend unavailable (%r)", e)
         return False
 
     orig_pwal = CompressedTensorsW8A8Int8MoEMethod.process_weights_after_loading
@@ -71,11 +71,11 @@ def install(logger) -> bool:
             cache = ExpertSlotCache(layer, SOURCES, num_experts, slots, device)
             layer._lru_slot_kernel = _build_slot_kernel(self, layer, cache)
             layer._lru_cache = cache
-            logger.info("lru-expert-cache: armed layer with %d/%d experts resident",
+            logger.info("expert-cache: armed layer with %d/%d experts resident",
                         slots, num_experts)
         except Exception as e:
             # Never break serving: without a cache the layer just reads through as before.
-            logger.warning("lru-expert-cache: disabled for layer (%r)", e)
+            logger.warning("expert-cache: disabled for layer (%r)", e)
             layer._lru_cache = None
 
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):

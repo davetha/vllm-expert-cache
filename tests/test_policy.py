@@ -1,4 +1,4 @@
-"""Validation for the device-side LRU expert kernels (liblruexpert.so).
+"""Validation for the device-side LRU expert kernels (libexpertcache.so).
 
 (a) policy: drive the REAL kernels with random and skewed routing, and check
     table / map_cold / slot_expert / slot_stamp / miss list / n_miss against an
@@ -6,7 +6,7 @@
 (b) data:   the gathered slabs must be bit-identical to the source rows.
 (c) timing: manager + gather at production shapes.
 
-Needs one GPU and a built liblruexpert.so (see kernels/build.sh). Point LRU_CACHE_LIB at
+Needs one GPU and a built libexpertcache.so (see kernels/build.sh). Point EXPERT_CACHE_LIB at
 the library if it is not next to the package. Set TRACE=<routes.npz> to additionally
 replay a captured routing trace.
 """
@@ -17,15 +17,15 @@ import sys
 import numpy as np
 import torch
 
-LIB = os.environ.get("LRU_CACHE_LIB", "../vllm_lru_cache/liblruexpert.so")
+LIB = os.environ.get("EXPERT_CACHE_LIB", "../vllm_expert_cache/libexpertcache.so")
 lib = ctypes.CDLL(LIB)
 hip = ctypes.CDLL("libamdhip64.so")
 
-lib.lru_manage.restype = ctypes.c_int
-lib.lru_manage.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 5 + \
+lib.expert_cache_manage.restype = ctypes.c_int
+lib.expert_cache_manage.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 5 + \
     [ctypes.c_void_p] * 8 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
-lib.lru_gather.restype = ctypes.c_int
-lib.lru_gather.argtypes = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long] * 6 +
+lib.expert_cache_gather.restype = ctypes.c_int
+lib.expert_cache_gather.argtypes = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long] * 6 +
                                [ctypes.c_void_p, ctypes.c_void_p,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_void_p])
 
@@ -81,7 +81,7 @@ class State:
 
 
 def ref_step(s, ids, max_distinct, max_inserts, policy=None, decay=None):
-    """Independent numpy model of lru_manage_k. Returns the expected miss list.
+    """Independent numpy model of expert_cache_manage_k. Returns the expected miss list.
 
     Models both victim rules. The per-slot priority is a recency stamp under LRU and a
     hit count under LFU; everything else -- scan order, the never-evict-what-this-step-
@@ -133,7 +133,7 @@ def ref_step(s, ids, max_distinct, max_inserts, policy=None, decay=None):
 
 
 def run_manage(s, ids_t, max_distinct, max_inserts):
-    rc = lib.lru_manage(
+    rc = lib.expert_cache_manage(
         ctypes.c_void_p(ids_t.data_ptr()), ids_t.numel(), s.E, s.S,
         max_distinct, max_inserts,
         ctypes.c_void_p(s.table.data_ptr()), ctypes.c_void_p(s.map_cold.data_ptr()),
@@ -142,7 +142,7 @@ def run_manage(s, ids_t, max_distinct, max_inserts):
         ctypes.c_void_p(s.miss.data_ptr()), ctypes.c_void_p(s.n_miss.data_ptr()),
         POLICY, DECAY,
         ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
-    assert rc == 0, f"lru_manage rc={rc}"
+    assert rc == 0, f"expert_cache_manage rc={rc}"
 
 
 def compare(s, exp, tag, step_no):
@@ -255,10 +255,10 @@ def main():
         for i in range(6):
             args += [ctypes.c_void_p(dst[i].data_ptr()), ctypes.c_void_p(src_d[i]),
                      ctypes.c_long(sizes[i])]
-        rc = lib.lru_gather(*args, ctypes.c_void_p(st.miss.data_ptr()),
+        rc = lib.expert_cache_gather(*args, ctypes.c_void_p(st.miss.data_ptr()),
                                 ctypes.c_void_p(st.n_miss.data_ptr()), 16, 64,
                                 ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
-        assert rc == 0, f"lru_gather rc={rc}"
+        assert rc == 0, f"expert_cache_gather rc={rc}"
         torch.cuda.synchronize()
         for (e, sl) in exp:
             for i, b in enumerate(sizes):
@@ -295,14 +295,14 @@ def main():
         tail = [ctypes.c_void_p(st.miss.data_ptr()), ctypes.c_void_p(st.n_miss.data_ptr()),
                 16, 64, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)]
         for _ in range(3):
-            lib.lru_gather(*args, *tail)
+            lib.expert_cache_gather(*args, *tail)
         torch.cuda.synchronize()
         a, b_ = torch.cuda.Event(True), torch.cuda.Event(True)
         stream = torch.cuda.current_stream()
         a.record(stream)
         R = 20
         for _ in range(R):
-            lib.lru_gather(*args, *tail)
+            lib.expert_cache_gather(*args, *tail)
         b_.record(stream)
         torch.cuda.synchronize()
         us = a.elapsed_time(b_) * 1000 / R

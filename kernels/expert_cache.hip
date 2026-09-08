@@ -6,14 +6,14 @@
 //
 // Two kernels, launched once per MoE layer per forward, ahead of moe_align_block_size:
 //
-//   lru_manage  one workgroup. Marks the experts routed this step, refreshes the LRU
+//   expert_cache_manage  one workgroup. Marks the experts routed this step, refreshes the LRU
 //               stamp of the resident ones, picks victims for the missing ones (argmin
 //               stamp over slots whose expert is NOT routed this step, so nothing needed
 //               now is ever evicted), rewrites `table` (expert -> slot) and `map_cold`
 //               (expert -> itself when not resident) in place, and emits the (expert,
 //               slot) miss list the gather then fills.
 //
-//   lru_gather  copies the six per-expert buffers (w1, w2 and their ws_t/wref scale rows)
+//   expert_cache_gather  copies the six per-expert buffers (w1, w2 and their ws_t/wref scale rows)
 //               from the UVA host tensors into their new slots, 16 bytes per lane.
 //
 // Both are pure device work with no host sync, so they are HIP-graph capturable: every
@@ -188,7 +188,7 @@ __device__ __forceinline__ int pickVictims(
   return nact;
 }
 
-extern "C" __global__ __launch_bounds__(NT) void lru_manage_k(
+extern "C" __global__ __launch_bounds__(NT) void expert_cache_manage_k(
     const int* __restrict__ topk_ids,     // [mk] routed expert ids, <0 = padding
     int mk, int E, int S,
     int max_distinct,                     // > this many distinct -> read-through, no inserts
@@ -283,7 +283,7 @@ extern "C" __global__ __launch_bounds__(NT) void lru_manage_k(
 
 // grid = (chunks, lanes), block = 256. Block (c, j) copies misses j, j+lanes, ... ; slabs
 // are split across the `chunks` blocks with a grid-stride loop of 16-byte accesses.
-extern "C" __global__ __launch_bounds__(NT) void lru_gather_k(
+extern "C" __global__ __launch_bounds__(NT) void expert_cache_gather_k(
     u32x4* __restrict__ d0, const u32x4* __restrict__ s0, int v0,
     u32x4* __restrict__ d1, const u32x4* __restrict__ s1, int v1,
     u32x4* __restrict__ d2, const u32x4* __restrict__ s2, int v2,
@@ -315,7 +315,7 @@ extern "C" __global__ __launch_bounds__(NT) void lru_gather_k(
 
 
 // ---------------------------------------------------------------------------------------
-// lru_fused_k: everything lru_manage_k does, PLUS both moe_align_block_size outputs -- the
+// expert_cache_fused_k: everything expert_cache_manage_k does, PLUS both moe_align_block_size outputs -- the
 // resident one (bucketed by `table`, i.e. by SLOT) and the fallback one (bucketed by
 // `map_cold`, i.e. by expert id) -- computed from the table it has just updated. That takes
 // the per-layer bookkeeping from 6 launches (manage, gather, 2 kernels per align x 2) to 2.
@@ -327,7 +327,7 @@ extern "C" __global__ __launch_bounds__(NT) void lru_gather_k(
 // the resident side that is the slot index, which is what _gemm_split needs to address the
 // hot buffers.
 //
-// SINGLE EXIT. lru_manage_k's two early returns (read-through, nothing to insert) become
+// SINGLE EXIT. expert_cache_manage_k's two early returns (read-through, nothing to insert) become
 // branches here. An early return would leave sorted_ids/expert_ids/npad holding the PREVIOUS
 // graph replay's values: silently wrong output, no crash, visible only on a wide step or a
 // step that happened to have no misses.
@@ -428,7 +428,7 @@ __device__ __forceinline__ void fillExpertIds(int nb, const int* __restrict__ cu
     for (int i = cum[b]; i < cum[b + 1]; i += bs) eids[i / bs] = b;
 }
 
-extern "C" __global__ __launch_bounds__(NT) void lru_fused_k(
+extern "C" __global__ __launch_bounds__(NT) void expert_cache_fused_k(
     const int* __restrict__ topk_ids, int mk, int E, int S,
     int max_distinct, int max_inserts,
     int* __restrict__ table, int* __restrict__ map_cold,
@@ -589,14 +589,14 @@ extern "C" __global__ __launch_bounds__(NT) void lru_fused_k(
 
 extern "C" {
 
-int lru_manage(const int* topk_ids, int mk, int E, int S, int max_distinct,
+int expert_cache_manage(const int* topk_ids, int mk, int E, int S, int max_distinct,
                    int max_inserts, int* table, int* map_cold, int* slot_expert,
                    long long* slot_stamp, unsigned char* routed, long long* step,
                    int* miss, int* n_miss, int policy, int decay, hipStream_t stream) {
   if (E <= 0 || S <= 0 || S > MAXS || S > SLOT_MASK) return -1;
   if (max_inserts < 0 || max_inserts > MAXINS) return -1;   // s_vic is MAXINS deep
   if (policy < 0 || policy > 1) return -1;
-  hipLaunchKernelGGL(lru_manage_k, dim3(1), dim3(NT), 0, stream, topk_ids, mk, E, S,
+  hipLaunchKernelGGL(expert_cache_manage_k, dim3(1), dim3(NT), 0, stream, topk_ids, mk, E, S,
                      max_distinct, max_inserts, table, map_cold, slot_expert, slot_stamp,
                      routed, step, miss, n_miss, policy, decay);
   return (int)hipGetLastError();
@@ -607,7 +607,7 @@ int lru_manage(const int* topk_ids, int mk, int E, int S, int max_distinct,
 // lengths vllm's python wrapper would have allocated:
 //   L  = mk < E ? min(mk*bs, mk + E*(bs-1)) : mk + E*(bs-1)
 //   NB = ceil(L / bs)
-int lru_fused(const int* topk_ids, int mk, int E, int S, int max_distinct,
+int expert_cache_fused(const int* topk_ids, int mk, int E, int S, int max_distinct,
                   int max_inserts, int* table, int* map_cold, int* slot_expert,
                   long long* slot_stamp, unsigned char* routed, long long* step,
                   int* miss, int* n_miss, int bs, int L, int NB,
@@ -616,14 +616,14 @@ int lru_fused(const int* topk_ids, int mk, int E, int S, int max_distinct,
   if (E <= 0 || E > MAXE || S <= 0 || S > MAXS || S > SLOT_MASK) return -1;
   if (bs <= 0 || L <= 0 || NB <= 0 || mk < 0) return -1;
   if (max_inserts < 0 || max_inserts > MAXE) return -1;     // s_vic aliases cnt_c[MAXE]
-  hipLaunchKernelGGL(lru_fused_k, dim3(1), dim3(NT), 0, stream, topk_ids, mk, E, S,
+  hipLaunchKernelGGL(expert_cache_fused_k, dim3(1), dim3(NT), 0, stream, topk_ids, mk, E, S,
                      max_distinct, max_inserts, table, map_cold, slot_expert, slot_stamp,
                      routed, step, miss, n_miss, bs, L, NB, sorted_hot, eids_hot, npad_hot,
                      sorted_cold, eids_cold, npad_cold);
   return (int)hipGetLastError();
 }
 
-int lru_gather(void* d0, const void* s0, long b0, void* d1, const void* s1, long b1,
+int expert_cache_gather(void* d0, const void* s0, long b0, void* d1, const void* s1, long b1,
                    void* d2, const void* s2, long b2, void* d3, const void* s3, long b3,
                    void* d4, const void* s4, long b4, void* d5, const void* s5, long b5,
                    const int* miss, const int* n_miss, int chunks, int lanes,
@@ -632,7 +632,7 @@ int lru_gather(void* d0, const void* s0, long b0, void* d1, const void* s1, long
   for (int i = 0; i < 6; i++)
     if (bs[i] <= 0 || bs[i] % 16) return -1;
   if (chunks <= 0 || lanes <= 0) return -1;
-  hipLaunchKernelGGL(lru_gather_k, dim3(chunks, lanes), dim3(NT), 0, stream,
+  hipLaunchKernelGGL(expert_cache_gather_k, dim3(chunks, lanes), dim3(NT), 0, stream,
                      (u32x4*)d0, (const u32x4*)s0, (int)(b0 / 16),
                      (u32x4*)d1, (const u32x4*)s1, (int)(b1 / 16),
                      (u32x4*)d2, (const u32x4*)s2, (int)(b2 / 16),
