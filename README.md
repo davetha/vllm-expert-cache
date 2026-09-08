@@ -233,6 +233,8 @@ Three separate pieces, in increasing order of difficulty:
 Point 3 is the one that decides feasibility, and it is a question about vLLM rather than about
 this package.
 
+For Intel specifically there is a step-by-step brief in [docs/porting-intel.md](docs/porting-intel.md).
+
 Note also that the limiting factor is the quantisation backend, not the GPU: this currently
 wires up compressed-tensors W8A8 int8 and nothing else. See
 [Supported backends](#supported-backends).
