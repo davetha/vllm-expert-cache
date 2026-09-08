@@ -209,18 +209,23 @@ Unknown for NVIDIA:
    yes; nobody has run it.
 2. Whether the benefit survives on your host link. See the section above — this is the real
    question, and on Grace Hopper the honest answer may be "no, and that is fine."
-3. Whether your model uses the one supported quantisation path
-   (`CompressedTensorsW8A8Int8MoEMethod`). A different path needs a new backend file, about 100
-   lines — see `vllm_expert_cache/backends/`.
+3. ~~Whether your model uses the one supported quantisation path.~~ No longer a
+   constraint: the plugin is quantisation-agnostic and discovers per-expert tensors by
+   shape, so any `FusedMoEMethodBase` subclass is fair game. It refuses, loudly and with a
+   reason, on monolithic methods, expert parallelism, non-16-byte-aligned per-expert slabs,
+   and any scheme whose per-expert tensors it cannot fully rebind.
 
 Two traps that cost us time writing the AMD backend and will recur in any new one:
 
 - Read the source tensors fresh on every call. vLLM's offloader relocates them to host memory
   *after* `process_weights_after_loading`, so a pointer captured at setup dangles and the gather
   faults.
-- Weights and their scales are indexed by the same id, so both must be slot-indexed. Scales reach
-  the kernel via a `FusedMoEQuantConfig` whose fields are read-only properties and cannot be
-  swapped per call; the int8 backend builds a second kernel once, bound to the slot scale buffers.
+- Weights and their scales are indexed by the same id, so both must be slot-indexed. Scales
+  reach the kernel via a `FusedMoEQuantConfig` whose fields are read-only properties and cannot
+  be swapped per call. The generic backend handles this without rebuilding any kernel: it
+  rebinds the layer's attributes to slot buffers, re-runs the scheme's own
+  `get_fused_moe_quant_config(layer)`, and assigns the result to
+  `moe_kernel.fused_experts.quant_config` for the duration of the call.
 
 ---
 

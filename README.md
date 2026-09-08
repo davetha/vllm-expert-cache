@@ -143,6 +143,15 @@ Wide steps — prefill, or any batch touching more distinct experts than there a
 the cache and read through the host copies on the unmodified path. Correctness never depends on
 the cache being warm, so a miss is a slowdown and never a wrong answer.
 
+Arming happens from vLLM's one generic post-load call site,
+`model_loader.utils.process_weights_after_loading`, rather than by patching the ~38
+`FusedMoEMethodBase` subclasses. That runs after every method has processed its weights and
+built its kernel, and `apply` is then wrapped per *instance* — so no vLLM class is
+monkeypatched, and nothing depends on which quantisation modules happen to be imported.
+Note that `base_loader` imports that function by name, so the hook rebinds it in every
+module already holding a reference as well as at the source; patching only the source
+leaves the plugin silently inert.
+
 ### Why it is branch-free
 
 The whole path avoids device-to-host synchronisation. The "does this step fit?" test is
@@ -186,26 +195,101 @@ the gap to widen. Both policies are validated bit-exactly against the reference 
 
 ## Supported backends
 
-- compressed-tensors **W8A8 int8** MoE (`CompressedTensorsW8A8Int8MoEMethod`)
+**Any of them, in principle** — the cache does not know what int8, fp8, mxfp4 or wNa16 mean,
+and there is no per-scheme code to write. It relies on three conventions that every
+`FusedMoEMethodBase` subclass in vLLM already follows:
 
-Anything else is left untouched: the plugin logs that it found no supported backend and stays
-out of the way.
+1. `apply` reads the weights off the layer: `self.moe_kernel.apply(x, layer.w13_weight,
+   layer.w2_weight, ...)`.
+2. Per-expert scales, zero points and biases are reachable by re-running the method's own
+   factory, `self.get_fused_moe_quant_config(layer)`, which every subclass implements by
+   reading named attributes off `layer`.
+3. The built kernel keeps that config in one mutable attribute,
+   `self.moe_kernel.fused_experts.quant_config`.
 
-### Adding one
+So the cache discovers the per-expert tensors by shape (leading dim == expert count), hangs
+slot buffers on the layer, re-runs the scheme's own config factory to get a slot-bound
+config, and swaps both in for the duration of a cached step.
 
-A backend needs to declare which per-expert tensors to mirror and point its kernel at the slot
-buffers. For int8 that is four tensors — the two weight matrices and their per-channel scales,
-because the fused kernel indexes weights and scales with the same id. See
-`vllm_expert_cache/backends/compressed_tensors_int8.py`; it is about 100 lines.
+Validated end to end on two structurally different paths, with no code between them:
 
-Two traps worth knowing before you write one:
+| Path | Method | Per-expert tensors discovered | Result |
+| --- | --- | --- | --- |
+| compressed-tensors W8A8 int8 | `CompressedTensorsW8A8Int8MoEMethod` | 4 (weights + channel scales) | 48/48 layers armed; **55.7 vs 18.7 tok/s** with the cache disabled (2.9x); greedy output byte-identical either way |
+| unquantized bf16 | `UnquantizedFusedMoEMethod` | 2 (weights only, no scales) | 8/8 layers armed; greedy output byte-identical on 3 prompts either way |
+| compressed-tensors W4A16 int4, group 128 | `CompressedTensorsWNA16MoEMethod` | 8 (packed weights + scales + g_idx + sort indices) | 8/8 layers armed; greedy output byte-identical on 3 prompts either way. Also the case that exercises >6 mirrored tensors, i.e. the multi-launch gather |
 
-- **Read the source tensors fresh on every call.** The expert offloader relocates them to host
-  memory *after* `process_weights_after_loading`, so a pointer captured at setup time dangles
-  and the gather faults.
-- **Scales usually cannot be swapped per call.** They reach the kernel through a
-  `FusedMoEQuantConfig` whose fields are read-only properties, so the int8 backend builds a
-  second kernel once, bound to the slot scale buffers.
+Two tensors, four, and eight; plain, and packed-and-aliased. Same code path for all three.
+
+The byte-identical greedy output is the load-bearing check: the cache is meant to be
+invisible to results and only visible in throughput.
+
+The arming path — discovery, slot binding, and every refusal below — is additionally
+covered for unquantized, int8-shaped and wNa16-shaped layers by `tests/test_generic.py`,
+which runs on CPU and needs neither a GPU nor a served model.
+
+### Where each scheme stands
+
+Every row below was served twice on the same hardware -- once with the cache on, once with
+`EXPERT_CACHE_DISABLE=1` -- and the greedy completions compared. **Identical output is the
+assertion**; throughput is a separate question and only the int8 row was measured for it.
+All of them run through the same code, and the "tensors" column is what discovery found
+without being told anything about the scheme.
+
+| Scheme | vLLM method | Registers | Tensors | Result |
+| --- | --- | --- | --- | --- |
+| unquantized bf16 | `UnquantizedFusedMoEMethod` | `w13_weight` | 2 | identical |
+| compressed-tensors W8A8 int8 | `CompressedTensorsW8A8Int8MoEMethod` | `w13_weight` | 4 | identical, and **2.9x** on a real 30B model |
+| compressed-tensors W8A8 fp8 | `CompressedTensorsW8A8Fp8MoEMethod` | `w13_weight` | 4 | identical |
+| compressed-tensors W4A16 int4 | `CompressedTensorsWNA16MoEMethod` | `w13_weight_packed` + alias | 8 | identical |
+| compressed-tensors W8A16 int8 (weight-only) | `CompressedTensorsWNA16MoEMethod` | `w13_weight_packed` + alias | 8 | identical |
+| GPTQ int4 | `AutoGPTQMoEMethod` | `w13_qweight` + alias | 4 | identical |
+| AWQ int4 | `AutoAWQMoEMethod` | `w13_qweight` + alias | 6 | identical |
+| compressed-tensors MXFP4 | `CompressedTensorsW4A4Mxfp4MoEMethod` | `w13_weight` | -- | **not reached on ROCm**, for reasons upstream of this package -- see below |
+
+Two, four, six and eight per-expert tensors; plain, packed, and packed-behind-an-alias;
+scales, zero points, group indices. One code path, no per-scheme code.
+
+#### Why MXFP4 does not load on ROCm
+
+Nothing to do with the cache, and worth writing down because the failure is three
+unrelated things stacking up:
+
+1. `CompressedTensorsW4A4Mxfp4MoEMethod.__init__` picks its backend from four branches:
+   `moe_backend == "b12x"` consults the backend oracle, CUTLASS is taken when the *device*
+   supports it, XPU has its own, and **everything else falls through to Marlin**. ROCm
+   matches none of the first three, so it always lands on Marlin.
+2. `--moe-backend emulation` does not help: only the literal string `"b12x"` reaches the
+   oracle, so every other value falls through the same `else`.
+3. Marlin is a CUDA-only kernel family, so `torch.ops._C.gptq_marlin_repack` does not
+   exist in a ROCm build. `process_weights_after_loading` raises `AttributeError` while
+   repacking the experts -- before this package's hook runs at all.
+
+Ironically MXFP4 would be the *easiest* case for the cache if it loaded: that method
+rebinds `w13_weight_packed` to a plain `layer.w13_weight` and deletes the packed name, so
+discovery would see the simple two-name shape rather than the packed-plus-alias one it
+already handles. The blocker is upstream and NVIDIA-specific, not a cache limitation.
+
+The remaining untested schemes -- NVFP4, ModelOpt's variants, gpt-oss MXFP4 -- register a
+plain `w13_weight` or the same packed-plus-alias shape as the validated rows, so the
+mechanism applies. That is a structural argument, not a measurement, and this table
+deliberately keeps the two apart.
+
+### What it declines, and why
+
+Correctness never depends on the cache, so anything it cannot prove it can do correctly it
+refuses out loud, logs the reason, and leaves the layer on the stock path:
+
+| Refusal | Reason |
+| --- | --- |
+| Monolithic methods | `apply_monolithic` takes `router_logits` and routes internally, so there are no `topk_ids` to remap into slot space |
+| Expert parallelism (`layer.expert_map` set) | routing ids are global and `expert_map` already folds them into a local range; composing that with the slot table is a second remap this does not implement |
+| A per-expert tensor the config factory reaches but layer-binding cannot | it would stay bound to full `[E]` storage while the ids are already slot-space, so every row would be the wrong expert's — silently |
+| A per-expert slab that is not a multiple of 16 bytes | the gather moves 16 bytes per lane and would drop the tail |
+
+That third one is the important guard. It compares the rebuilt config against the full one
+and names the field that leaked, so a scheme that hides a per-expert tensor produces a
+refusal rather than quietly wrong output.
 
 ---
 
@@ -258,10 +342,18 @@ wires up compressed-tensors W8A8 int8 and nothing else. See
 
 ```bash
 kernels/build.sh gfx90a
-POLICY=0 python tests/test_policy.py     # LRU
-POLICY=1 python tests/test_policy.py     # LFU
+POLICY=0 python tests/test_policy.py     # LRU kernels vs numpy reference
+POLICY=1 python tests/test_policy.py     # LFU kernels vs numpy reference
 python tests/compare_policies.py         # miss counts, policy vs policy
+python tests/test_generic.py             # arming: discovery, binding, refusals (CPU only)
 ```
+
+`test_generic.py` drives the quantisation-agnostic arming path against synthetic stand-ins
+for vLLM's classes: that the right per-expert tensors are discovered for unquantized,
+int8-shaped and wNa16-shaped layers, that the rebuilt quant config really ends up on slot
+storage, that the layer is restored exactly as found, that `apply` still accepts vLLM's
+keyword call, and that each of the four refusal conditions fires with a reason naming the
+offending field.
 
 `test_policy.py` drives the real kernels with random and skewed routing and checks the table,
 cold map, slot contents, priorities and miss list against an independent numpy implementation
@@ -287,7 +379,12 @@ it and the number moves fifty times that.
 
 ## Limitations
 
-- One quantisation backend so far (compressed-tensors int8).
+- Quantisation-agnostic by construction, but only compressed-tensors int8 has been
+  measured end to end; other schemes are exercised by the arming tests, not by a served
+  model. Expect the packed int4 family to need the most scrutiny — Marlin-style repacking
+  may not leave weights expert-major and 16-byte aligned, which the cache will refuse
+  rather than mishandle.
+- Expert parallelism and monolithic MoE methods are refused outright, not supported.
 - The fit test is conservative. It bounds distinct experts by `tokens x top_k` rather than
   counting them, so batches that would have fit sometimes read through. A device-side count
   would need a host sync and cost graph capture, which is not worth it.
