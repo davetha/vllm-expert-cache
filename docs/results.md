@@ -13,15 +13,21 @@
 
 ## Decode throughput vs resident-expert budget
 
-| Experts in VRAM | Decode (tok/s) | vs resident |
-| --- | --- | --- |
-| 128 (no offload) | 65.7 | 100% |
-| 96 | 58.4 | 89% |
-| 64 | 54.3 | 83% |
-| 48 | 49.3 | 75% |
-| 32 | 39.4 | 60% |
-| 16 | 30.8 | 47% |
-| 0 (offload, cache disabled) | 19.1 | 29% |
+| Experts in VRAM | Expert offload | Cache | Decode | vs. fully resident | vs. no cache |
+| --- | --- | --- | --- | --- | --- |
+| 128 (all) | off | n/a | 65.7 tok/s | 100% | 3.4x |
+| 96 | on | **on** | 58.4 tok/s | 89% | **3.1x** |
+| 64 | on | **on** | 54.3 tok/s | 83% | **2.8x** |
+| 48 | on | **on** | 49.3 tok/s | 75% | **2.6x** |
+| 32 | on | **on** | 39.4 tok/s | 60% | **2.1x** |
+| 16 | on | **on** | 30.8 tok/s | 47% | **1.6x** |
+| 0 | on | off | 19.1 tok/s | 29% | 1.0x (baseline) |
+
+The last row is what expert offload costs you *without* this package, and the top row is the
+speed you gave up to get the VRAM back. Every row between is the same offloaded model with the
+cache turned on: same host-resident weights, same `--cpu-offload-params experts`, just a
+different number of experts cached back into VRAM. At half the experts the cache recovers
+**2.8x** the un-cached rate and lands within 17% of never having offloaded at all.
 
 Returns diminish as the budget grows: the first 32 slots roughly double throughput over the
 un-cached floor, while the last 32 (96 -> 128) buy about 7 tok/s.

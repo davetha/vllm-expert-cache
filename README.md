@@ -22,19 +22,23 @@ the experts absorbs most of the reads.
 Measured on 2x AMD Instinct MI210 (gfx90a), Qwen3-30B-A3B-Instruct-2507 W8A8 (128 experts,
 top-8, 48 layers), TP2, single-stream greedy decode:
 
-| Experts kept in VRAM | Decode | vs. fully resident |
-| --- | --- | --- |
-| 128 (all resident, no offload) | 65.7 tok/s | 100% |
-| 96 | 58.4 tok/s | 89% |
-| 64 | 54.3 tok/s | 83% |
-| 48 | 49.3 tok/s | 75% |
-| 32 | 39.4 tok/s | 60% |
-| 16 | 30.8 tok/s | 47% |
-| 0 (offload, cache disabled) | 19.1 tok/s | 29% |
+| Experts in VRAM | Expert offload | Cache | Decode | vs. fully resident | vs. no cache |
+| --- | --- | --- | --- | --- | --- |
+| 128 (all) | off | n/a | 65.7 tok/s | 100% | 3.4x |
+| 96 | on | **on** | 58.4 tok/s | 89% | **3.1x** |
+| 64 | on | **on** | 54.3 tok/s | 83% | **2.8x** |
+| 48 | on | **on** | 49.3 tok/s | 75% | **2.6x** |
+| 32 | on | **on** | 39.4 tok/s | 60% | **2.1x** |
+| 16 | on | **on** | 30.8 tok/s | 47% | **1.6x** |
+| 0 | on | off | 19.1 tok/s | 29% | 1.0x (baseline) |
 
-Half the experts resident holds **83%** of full speed. Even an eighth still runs **1.6x** the
-un-cached offload floor. Returns diminish as the budget grows: the first 32 slots roughly
-double throughput, while the last 32 buy about 7 tok/s.
+The last row is what expert offload costs you *without* this package, and the top row is the
+speed you gave up to get the VRAM back. Every row between is the same offloaded model with the
+cache turned on: same host-resident weights, same `--cpu-offload-params experts`, just a
+different number of experts cached back into VRAM. At half the experts the cache recovers
+**2.8x** the un-cached rate and lands within 17% of never having offloaded at all.
+
+Returns diminish as the budget grows: the first 16 slots are worth more than the last 32.
 
 ---
 
