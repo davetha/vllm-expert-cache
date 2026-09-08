@@ -212,6 +212,40 @@ Two traps that cost us time when writing the AMD backend, likely to recur:
 
 ---
 
+## Sizing for a small card (Arc B580 and similar)
+
+A 12 GB consumer card is a *good* target for this, not a marginal one — the whole point is
+running a model whose experts do not fit.
+
+Worked example with the model we tested, Qwen3-30B-A3B W8A8 (~30 GB on disk). Splitting that as
+measured: **~27 GB is expert weights** (128 experts, so ~212 MB each) and **~3 GB is everything
+else** — attention, embeddings, norms. Only that ~3 GB plus the KV cache has to be permanently
+resident. On a 12 GB card that plausibly leaves ~6-7 GB for expert slots, or **roughly 30 of the
+128 experts**.
+
+On our curve, 32 slots ran at 60% of fully-resident speed. So the realistic outcome is not "a bit
+slower than a big GPU" — it is that a model which **cannot be loaded at all** on 12 GB becomes
+runnable at around 60% of the speed of hardware with 30 GB of VRAM. That is the case this package
+exists for.
+
+Two B580 specifics:
+
+- **PCIe 4.0 x8**, roughly half the host-to-device bandwidth of the x16 link we measured (27 GB/s).
+  That makes each cache miss more expensive, which means the cache should matter **more** here,
+  not less — the un-cached floor drops further than the cached figure does. It also makes the LFU
+  policy (the default, ~11-26% fewer fetches than LRU) more valuable, since every avoided transfer
+  is worth more.
+- **Sub-group width.** Xe sub-groups are 8/16/32 against AMD's 32/64. This normally breaks ported
+  kernels, and it is precisely why the absence of any shuffle or ballot in these kernels matters:
+  there is no execution-width assumption to fix.
+
+If 30B is too tight, any smaller MoE works the same way — the mechanism cares about the ratio of
+expert weights to VRAM, not the absolute size. Start with whatever MoE your XPU stack already
+serves correctly, since Step 0 has to pass on it first regardless.
+
+These are estimates from our AMD measurements, not numbers from a B580. Treat them as a sizing
+guide for the first experiment, not a prediction.
+
 ## Reporting back
 
 Issues and results are welcome at https://github.com/davetha/vllm-expert-cache — including a
