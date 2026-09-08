@@ -213,12 +213,29 @@ no warp-width intrinsics — so one source serves both wavefront widths:
 kernels/build.sh gfx90a gfx942 gfx1201    # one fat binary for all three
 ```
 
-Nothing in the Python layer is device-specific. NVIDIA support needs the HIP kernels ported —
-they are plain HIP with no AMD matrix intrinsics, so the port is mechanical, but it has not been
-done.
+### Porting to another vendor
 
-Note that the limiting factor is the quantisation backend, not the GPU: this currently wires up
-compressed-tensors W8A8 int8 and nothing else. See [Supported backends](#supported-backends).
+Three separate pieces, in increasing order of difficulty:
+
+1. **The kernels.** Plain HIP with no matrix intrinsics and, more importantly, no warp-width
+   intrinsics — no shuffles, no ballots, no sub-group assumptions. That is normally the hardest
+   part of a cross-vendor port and here it does not exist, so HIP to CUDA is close to a rename
+   and HIP to SYCL is a mechanical rewrite of the barrier and local-memory calls.
+2. **This package's Python layer**, which is *not* currently device-agnostic: it resolves the
+   stream via `torch.cuda.current_stream().cuda_stream` and allocates on `torch.device("cuda")`.
+   Under ROCm those map to HIP, but another backend needs the accessor abstracted. Small, real,
+   not yet done.
+3. **The foundation underneath it.** This cache does not offload anything itself — it caches
+   experts that vLLM's own `--cpu-offload-params experts` already placed in host memory. That
+   offloader needs to work, with device-readable host allocations, on the target platform. If it
+   does not, there is nothing for this to sit on top of, and no amount of kernel porting helps.
+
+Point 3 is the one that decides feasibility, and it is a question about vLLM rather than about
+this package.
+
+Note also that the limiting factor is the quantisation backend, not the GPU: this currently
+wires up compressed-tensors W8A8 int8 and nothing else. See
+[Supported backends](#supported-backends).
 
 ---
 
