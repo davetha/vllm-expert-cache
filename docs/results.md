@@ -45,50 +45,53 @@ From `tests/test_policy.py` on one MI210:
 - Policy correctness: matches an independent numpy LRU reference on every field, every step,
   across five routing patterns; gathered bytes are identical to their source rows.
 
-## Replacement policy: LRU vs LFU -- INCONCLUSIVE
+## Replacement policy: LRU vs LFU
 
-The kernel supports a second victim rule (`LRU_CACHE_POLICY=lfu`), storing a per-slot hit count
-with periodic halving instead of a recency stamp. **Whether it beats LRU is unresolved**, and the
-measurements below are recorded mainly as a warning about how to measure this.
+**LFU fetches 11-26% fewer experts than LRU.** Measured with `tests/compare_policies.py`, which
+drives the real manage kernel over an identical routing trace under each policy and counts
+inserts. Deterministic, no serving, so there is no throughput noise to hide behind:
 
-Each cell is one serve, 6-9 timed 200-token decodes, warm-up discarded, 16 slots:
+| Workload | Slots | LRU misses | LFU misses | Change |
+| --- | --- | --- | --- | --- |
+| single stream, zipf | 16 | 2392 | 1980 | **-17.2%** |
+| | 32 | 1555 | 1239 | **-20.3%** |
+| | 64 | 758 | 674 | **-11.1%** |
+| 4 tasks interleaved | 16 | 2289 | 1899 | **-17.0%** |
+| | 32 | 1347 | 1096 | **-18.6%** |
+| | 64 | 489 | 363 | **-25.8%** |
 
-| Condition | LRU | LFU | Apparent winner |
-| --- | --- | --- | --- |
-| serve 1 | 30.09 | 31.84 | LFU by 5.8% |
-| serve 2 (identical config) | 31.20 | 30.13 | LRU by 3.6% |
-| throttled gather (c=2, l=8) | 27.48 | 26.68 | LRU by 3.0% |
+### Why that is only ~1-2% of throughput here
 
-The sign is not stable. Re-running the *same* configuration moved LRU by 1.11 tok/s and LFU by
-1.71 tok/s, so between-serve variance is 3-6% -- larger than any policy effect being claimed.
-Pooled, LRU averages 30.65 and LFU 30.99, a gap well inside that noise. There is no evidence
-either policy is better at this budget. LRU remains the default.
+A miss costs one PCIe transfer, but transfers are a fraction of decode time at these budgets, so
+cutting them by a fifth moves end-to-end throughput only slightly. Under 4 concurrent streams on
+different tasks (32 slots, aggregate tok/s, plateau values, policies alternated across serves):
 
-### The methodology trap
+| Replicate | LRU | LFU |
+| --- | --- | --- |
+| A | 50.6 | 51.3 |
+| B | 50.7 | 51.5 |
 
-Within a single serve these measurements are extraordinarily tight: spreads of 0.02-0.15 tok/s
-across nine runs. That precision is real but it answers the wrong question -- it is the
-repeatability of one loaded process, not the reproducibility of a configuration. Restart the
-server and the number moves by 50x that spread.
+Both replicates favour LFU, by 1.3% and 1.6%.
 
-This burned two successive conclusions here. A two-run comparison said LFU was worse; a
-nine-run-single-serve comparison said LFU was 5.8% better and called it decisive because the
-ranges were disjoint. Both were artefacts. **The unit of replication has to be the serve.**
+**This is why the earlier throughput-only comparisons were worthless.** Between-serve variance is
+3-6%; the real effect is 1-2%. Single-stream A/B runs flip-flopped (LFU +5.8%, then LRU +3.6%,
+then LRU +3.0%) purely as noise around a small true value. Measuring a 1-2% effect with a 5% ruler
+produces sign changes, not answers. **Count misses, do not time tokens** -- miss count is
+deterministic, is what the policy actually controls, and needs no server at all.
 
-To actually resolve an effect this size, either run 5+ independent serves per arm and compare
-serve means, or make the policy switchable at runtime so both arms can be interleaved inside one
-process, which removes the between-serve term entirely. The latter is the cheaper experiment and
-is not yet implemented.
+### Expect a larger win on a slower link
 
-The same caveat applies to the throttled-gather run, so it does **not** answer whether a slower
-link would favour one policy: that comparison carries the identical confound.
+The miss reduction is a property of the policy; the value of avoiding a miss scales with transfer
+cost. On PCIe slower than the Gen4 x16 used here (~27 GB/s measured), the same 11-26% fewer
+transfers converts into proportionally more throughput. These numbers are close to LFU's
+weakest case.
 
-### What this does not undermine
+### Recommendation
 
-The slot-budget curve is unaffected. Differences between budgets are 5-10 tok/s -- several times
-the ~1.5 tok/s serve noise -- so the shape is solid even though each individual point carries that
-uncertainty. (Consistently, 32 slots measured 39.4 in one serve and 40.75 in another.) The same
-holds for the cache-on vs cache-off control, which is a 20 tok/s effect.
+Prefer `LRU_CACHE_POLICY=lfu` when the budget is tight or the link is slow. LRU remains the
+default only because it is the policy with a bit-exact reference test (`tests/test_policy.py`
+validates policy 0 against a numpy model on every field of every step); LFU has no equivalent
+yet. Writing that reference is the obvious next step before promoting LFU to the default.
 
 ## Verifying the cache is actually engaged
 

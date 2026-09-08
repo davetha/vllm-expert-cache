@@ -93,30 +93,26 @@ every rank's cache evolves identically with no cross-rank communication.
 
 ## Does a smarter policy help?
 
-Unresolved -- and the attempt is instructive. An LFU rule (frequency with decay) ships alongside
-the default LRU, but repeated measurement could not establish a winner at 16 slots:
+Yes -- LFU fetches **11-26% fewer experts** than LRU across budgets and workloads. Measured by
+counting inserts over an identical routing trace (`tests/compare_policies.py`), which is
+deterministic and needs no server:
 
-| Condition | LRU | LFU |
-| --- | --- | --- |
-| serve 1 | 30.09 | 31.84 |
-| serve 2, identical config | 31.20 | 30.13 |
+| Workload | 16 slots | 32 slots | 64 slots |
+| --- | --- | --- | --- |
+| single stream | -17.2% | -20.3% | -11.1% |
+| 4 tasks interleaved | -17.0% | -18.6% | -25.8% |
 
-Re-running the same configuration moves each policy by more than the gap between them, so
-between-serve variance (3-6%) dominates. LRU stays the default; do not expect a win from
-switching.
+End-to-end that is worth only 1-2% here (4 concurrent streams: LRU 50.6/50.7 vs LFU 51.3/51.5
+tok/s across two serves), because PCIe transfers are a fraction of decode time at these budgets.
+On a slower link, where each avoided transfer is worth more, expect the gap to widen.
 
-Beware the measurement trap this exposes. Within one serve these numbers are tight to 0.02 tok/s
-across nine runs, which looks decisive and is not -- it measures one loaded process, not the
-configuration. Restart the server and the number moves 50x that. **Replicate across serves, not
-within one.** See `docs/results.md`.
+Set `LRU_CACHE_POLICY=lfu` if your budget is tight or your bus is slow. LRU stays the default only
+because it is the policy covered by the bit-exact reference test; giving LFU the same treatment is
+the prerequisite for promoting it.
 
-The budget curve above is unaffected: those differences are 5-10 tok/s against ~1.5 tok/s of serve
-noise, as is the cache-on/off control at 20 tok/s.
-
-Regardless of policy, the victim rule only reorders which transfers happen. A miss costs ~50 us of
-PCIe for a ~1.3 MB expert against ~11 us for the whole manager kernel, so cutting transfers --
-prefetching the next layer's experts during the current layer's compute, or giving more slots to
-layers with flatter routing -- is the larger lever.
+**Measure misses, not tokens.** Between-serve throughput variance here is 3-6% while the policy
+effect is 1-2%, so timing tokens produces sign flips rather than answers -- it did exactly that to
+us three times running. See `docs/results.md`.
 
 ## Supported backends
 
