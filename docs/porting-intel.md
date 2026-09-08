@@ -74,17 +74,18 @@ correctly decline to engage and you will measure nothing.
 
 ## Step 1 — Fix this package's device assumptions
 
-Small and mechanical, but it will not run without it. The Python layer is currently CUDA/ROCm
-only in two places (under ROCm, `torch.cuda` transparently maps to HIP, which is why this went
-unnoticed):
+Small and mechanical, but it will not run without it. The Python layer is down to **one**
+CUDA/ROCm assumption (under ROCm, `torch.cuda` transparently maps to HIP, which is why this
+went unnoticed):
 
 - `vllm_expert_cache/cache.py` — `torch.cuda.current_stream().cuda_stream`, the stream handle
   passed to both kernels.
-- `vllm_expert_cache/backends/compressed_tensors_int8.py` — `torch.device("cuda", ...)` for the
-  slot buffers.
 
-Both need an accessor that resolves to `torch.xpu` on XPU. The kernels need whatever opaque queue
-or stream handle your runtime uses in place of the HIP stream pointer.
+That needs an accessor resolving to `torch.xpu` on XPU, and the kernels need whatever opaque
+queue or stream handle your runtime uses in place of the HIP stream pointer.
+
+Slot buffers are no longer a second site: they are allocated on the device the layer's own
+weights are already on, so they follow whatever vLLM chose.
 
 ---
 
@@ -193,10 +194,11 @@ Unknown for Intel, in the order that matters:
 
 1. Whether vLLM's expert offload works on XPU with device-readable host memory. **This decides
    feasibility.**
-2. Whether the compressed-tensors W8A8 int8 MoE path (`CompressedTensorsW8A8Int8MoEMethod`) is
-   what XPU actually uses. This package patches that one method and nothing else; a different
-   quantisation path needs a new backend file, which is about 100 lines — see
-   `vllm_expert_cache/backends/`.
+2. ~~Whether the compressed-tensors W8A8 int8 MoE path is what XPU actually uses.~~ No
+   longer a constraint: the plugin is quantisation-agnostic and discovers per-expert tensors
+   by shape, so any `FusedMoEMethodBase` subclass is fair game. It refuses, loudly and with a
+   reason, on monolithic methods, expert parallelism, non-16-byte-aligned per-expert slabs,
+   and any scheme whose per-expert tensors it cannot fully rebind.
 3. Whether Intel's host-to-device bandwidth makes the tradeoff worthwhile at all. On PCIe Gen4 we
    measured the gather running at 27 GB/s, the hardware roofline, and a miss costing ~50 us for a
    1.3 MB expert. If your link is slower, the cache should matter *more*, not less.
@@ -206,9 +208,12 @@ Two traps that cost us time when writing the AMD backend, likely to recur:
 - Read the source tensors fresh on every call. vLLM's offloader relocates them to host memory
   *after* `process_weights_after_loading`, so a pointer captured at setup time dangles and the
   gather faults.
-- Weights and their scales are indexed by the same id, so both must be slot-indexed. Scales reach
-  the kernel through a `FusedMoEQuantConfig` whose fields are read-only properties and cannot be
-  swapped per call; the int8 backend builds a second kernel once, bound to the slot scale buffers.
+- Weights and their scales are indexed by the same id, so both must be slot-indexed. Scales
+  reach the kernel via a `FusedMoEQuantConfig` whose fields are read-only properties and cannot
+  be swapped per call. The generic backend handles this without rebuilding any kernel: it
+  rebinds the layer's attributes to slot buffers, re-runs the scheme's own
+  `get_fused_moe_quant_config(layer)`, and assigns the result to
+  `moe_kernel.fused_experts.quant_config` for the duration of the call.
 
 ---
 
