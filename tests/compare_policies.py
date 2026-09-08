@@ -75,7 +75,8 @@ def interleaved_trace(rng, steps, E, k, ntask=4, a=1.2, shared=0.5):
 
 if __name__ == "__main__":
     E, k, steps = 128, 8, 600
-    print(f"E={E} top_k={k} steps={steps}   (misses = experts fetched over PCIe)\n")
+    print(f"E={E} top_k={k} steps={steps} -> {steps * k} expert lookups\n"
+          f"miss = a lookup that required a PCIe fetch; rate is misses/lookups\n")
     for name, gen in (("single-stream zipf", zipf_trace),
                       ("4 tasks interleaved", interleaved_trace)):
         print(f"--- {name} ---")
@@ -84,7 +85,9 @@ if __name__ == "__main__":
             trace = gen(rng, steps, E, k)
             lru = run(trace, E, S, 0)
             lfu = run(trace, E, S, 1)
+            refs = steps * k          # expert lookups: every one is a hit or a PCIe fetch
             d = (lfu - lru) / max(lru, 1) * 100
             verdict = "LFU better" if lfu < lru else ("tie" if lfu == lru else "LFU WORSE")
-            print(f"  slots={S:3d}   LRU {lru:6d}   LFU {lfu:6d}   {d:+6.1f}%   {verdict}")
+            print(f"  slots={S:3d}   LRU {lru:6d} ({lru / refs * 100:4.1f}%)"
+                  f"   LFU {lfu:6d} ({lfu / refs * 100:4.1f}%)   {d:+6.1f}%   {verdict}")
         print()

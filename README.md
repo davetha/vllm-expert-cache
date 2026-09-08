@@ -162,10 +162,21 @@ rank's cache evolves identically with no cross-rank communication.
 `lfu` (default) stores a per-slot hit count with periodic halving; `lru` stores a recency stamp.
 LFU fetches **11-26% fewer experts** across budgets and workloads:
 
-| Workload | 16 slots | 32 slots | 64 slots |
-| --- | --- | --- | --- |
-| single stream | -17.2% | -20.3% | -11.1% |
-| 4 tasks interleaved | -17.0% | -18.6% | -25.8% |
+Miss rate is the fraction of expert lookups that needed a PCIe fetch, over 600 steps of top-8
+routing across 128 experts (4,800 lookups). Raw fetch counts in brackets:
+
+| Workload | Slots | LRU miss rate | LFU miss rate | Fewer fetches |
+| --- | --- | --- | --- | --- |
+| single stream | 16 | 49.8% (2392) | 41.2% (1980) | **-17.2%** |
+| | 32 | 32.4% (1555) | 25.8% (1239) | **-20.3%** |
+| | 64 | 15.8% (758) | 14.0% (674) | **-11.1%** |
+| 4 tasks interleaved | 16 | 47.7% (2289) | 39.6% (1899) | **-17.0%** |
+| | 32 | 28.1% (1347) | 22.8% (1096) | **-18.6%** |
+| | 64 | 10.2% (489) | 7.6% (363) | **-25.8%** |
+
+Note how steeply the miss rate falls with budget — from ~50% at 16 slots to ~10-16% at 64. That
+is the same curve the throughput table shows, measured directly and without any timing noise.
+Reproduce with `python tests/compare_policies.py`.
 
 End to end that is worth only 1-2% on this machine, because PCIe transfers are a fraction of
 decode time at these budgets. On a slower link, where each avoided transfer costs more, expect
@@ -233,7 +244,9 @@ Three separate pieces, in increasing order of difficulty:
 Point 3 is the one that decides feasibility, and it is a question about vLLM rather than about
 this package.
 
-For Intel specifically there is a step-by-step brief in [docs/porting-intel.md](docs/porting-intel.md).
+Step-by-step briefs for the two vendor ports: [NVIDIA](docs/porting-nvidia.md) (nearly free —
+four HIP symbols and one typedef; the Python layer needs no changes) and
+[Intel / XPU](docs/porting-intel.md) (gated on whether vLLM's expert offload works there at all).
 
 Note also that the limiting factor is the quantisation backend, not the GPU: this currently
 wires up compressed-tensors W8A8 int8 and nothing else. See
