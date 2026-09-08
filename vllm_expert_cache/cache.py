@@ -1,11 +1,11 @@
 """Per-MoE-layer expert slot cache.
 
 The model's full expert tensors stay where the offloader put them -- host RAM, mapped so
-the GPU can read them. This class adds a small set of VRAM *slots* and an LRU that decides
+the GPU can read them. This class adds a small set of VRAM *slots* and a policy that decides
 which experts occupy them. Each forward:
 
-  1. `expert_cache_manage` marks the experts routed this step, refreshes their stamps, evicts the
-     least-recently-routed slots that this step does NOT need, and emits a miss list.
+  1. `expert_cache_manage` marks the experts routed this step, refreshes their priorities,
+     evicts the lowest-priority slots that this step does NOT need, and emits a miss list.
   2. `expert_cache_gather` pulls each missing expert's rows from host memory into its new slot.
   3. The routing ids are remapped expert -> slot, and the stock fused-MoE kernel runs
      against the slot buffers.
@@ -13,6 +13,11 @@ which experts occupy them. Each forward:
 Nothing here reads a device value back to the host, so the sequence is graph-capturable.
 Both tensor-parallel ranks see identical routing and the kernels are deterministic, so the
 caches evolve identically across ranks without any synchronisation.
+
+The set of mirrored tensors is whatever the caller passes: two for an unquantized model,
+four for int8 (weights plus their scales), six for a scheme that also carries zero points.
+The gather kernel copies a fixed `GATHER_SLOTS` buffers per launch, so wider sets are split
+across several launches rather than needing a wider kernel.
 """
 
 from __future__ import annotations
@@ -33,7 +38,8 @@ def _bytes_per_expert(t: torch.Tensor) -> int:
 class ExpertSlotCache:
     """Holds `num_slots` of `num_experts` experts resident in device memory."""
 
-    def __init__(self, owner, source_names, num_experts: int, num_slots: int, device):
+    def __init__(self, owner, source_names, num_experts: int, num_slots: int, device,
+                 required=()):
         # Sources are read fresh from `owner` on every step: vLLM's expert offloader
         # relocates these tensors to host memory *after* weight loading, so a pointer
         # captured at setup time would dangle.
@@ -43,11 +49,37 @@ class ExpertSlotCache:
         self.S = int(num_slots)
 
         self.slots = {}
+        self.skipped = []
+        ragged = []
         for n in self.names:
             full = getattr(owner, n).data
+            # The gather moves 16 bytes per lane, so a per-expert slab that is not a
+            # multiple of 16 would have its tail dropped -- silently, since the kernel
+            # only reports launch failures.
+            #
+            # A ragged *weight* is fatal: the fused kernel is handed it directly. A ragged
+            # anything-else is usually bookkeeping (wNa16 registers a 2-element
+            # `w13_weight_shape` holding the original dims), so skip mirroring it and let
+            # the caller's leak check decide -- if the quantisation config really does
+            # index it per expert, that check refuses the layer; if it does not, mirroring
+            # it was never needed.
+            if _bytes_per_expert(full) % 16:
+                (ragged if n in required else self.skipped).append(
+                    f"{n}{tuple(full.shape)}={_bytes_per_expert(full)}B")
+                continue
             self.slots[n] = torch.empty(
                 (self.S,) + tuple(full.shape[1:]), dtype=full.dtype, device=device
             )
+        if ragged:
+            raise ValueError(
+                "per-expert slab must be a multiple of 16 bytes, but these are not: "
+                + ", ".join(ragged))
+        self.names = [n for n in self.names if n in self.slots]
+
+        # What the layer's attributes are rebound to during a cached step. Built once:
+        # vLLM captures parameter storage addresses into CUDA/HIP graphs, and churning
+        # Parameter objects on the hot path is wasted work besides.
+        self.bound: dict[str, torch.Tensor] = dict(self.slots)
 
         i32, i64, u8 = torch.int32, torch.int64, torch.uint8
         self.table = torch.full((self.E,), -1, dtype=i32, device=device)   # expert -> slot
@@ -104,23 +136,28 @@ class ExpertSlotCache:
         for n in self.names:
             dsts.append(self.slots[n])
             srcs.append(getattr(self.owner, n).data)
-        # The gather kernel always copies six buffers; pad by repeating the last real one
-        # (a redundant but valid copy) rather than passing unreadable memory.
-        while len(dsts) < GATHER_SLOTS:
-            dsts.append(dsts[-1])
-            srcs.append(srcs[-1])
 
-        args = []
-        for d, s in zip(dsts, srcs):
-            args += [ctypes.c_void_p(d.data_ptr()), ctypes.c_void_p(s.data_ptr()),
-                     ctypes.c_long(_bytes_per_expert(s))]
-        rc = h.expert_cache_gather(
-            *args,
-            ctypes.c_void_p(self.miss.data_ptr()),
-            ctypes.c_void_p(self.n_miss.data_ptr()),
-            self.chunks, self.lanes, stream,
-        )
-        if rc != 0:
-            raise RuntimeError(f"expert_cache_gather failed rc={rc} (slab sizes must be 16B multiples)")
+        # The gather kernel copies a fixed GATHER_SLOTS buffers per launch. Split wider
+        # sets across launches, and pad the last group by repeating a buffer it already
+        # carries (a redundant but valid copy) rather than passing unreadable memory.
+        for i in range(0, len(dsts), GATHER_SLOTS):
+            gd = dsts[i:i + GATHER_SLOTS]
+            gs = srcs[i:i + GATHER_SLOTS]
+            while len(gd) < GATHER_SLOTS:
+                gd.append(gd[-1])
+                gs.append(gs[-1])
+
+            args = []
+            for d, s in zip(gd, gs):
+                args += [ctypes.c_void_p(d.data_ptr()), ctypes.c_void_p(s.data_ptr()),
+                         ctypes.c_long(_bytes_per_expert(s))]
+            rc = h.expert_cache_gather(
+                *args,
+                ctypes.c_void_p(self.miss.data_ptr()),
+                ctypes.c_void_p(self.n_miss.data_ptr()),
+                self.chunks, self.lanes, stream,
+            )
+            if rc != 0:
+                raise RuntimeError(f"expert_cache_gather failed rc={rc}")
 
         return self.remap(topk_ids)
