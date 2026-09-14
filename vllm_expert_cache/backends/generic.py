@@ -155,6 +155,31 @@ def _report_stats(cache, owned_ids, logger) -> None:
             100.0 * (1.0 - _STATS["miss"] / max(1, _STATS["req"])))
 
 
+_TIMING = {"n": 0, "refresh": 0.0, "moe": 0.0, "remap": 0.0, "pend": [], "pend_remap": []}
+_timing_every = int(os.environ.get("EXPERT_CACHE_TIMING", "0"))
+
+
+def _drain_timing(logger) -> None:
+    """Attribute the layer's time between refresh (manage + gather) and the MoE
+    itself. Events are recorded per call and only read in bulk, so the hot path
+    pays two event records rather than a sync."""
+    for e0, e1, e2 in _TIMING["pend"]:
+        e2.synchronize()
+        _TIMING["refresh"] += e0.elapsed_time(e1)
+        _TIMING["moe"] += e1.elapsed_time(e2)
+    _TIMING["pend"].clear()
+    for e0, eref, e1 in _TIMING["pend_remap"]:
+        e1.synchronize()
+        _TIMING["remap"] += eref.elapsed_time(e1)
+    _TIMING["pend_remap"].clear()
+    n = _TIMING["n"]
+    if n:
+        logger.info(
+            "expert-cache timing: %d layer-calls | refresh %.3f ms/call | "
+            "moe %.3f ms/call | remap %.3f ms/call",
+            n, _TIMING["refresh"] / n, _TIMING["moe"] / n, _TIMING["remap"] / n)
+
+
 def _decline(layer, method, num_experts: int) -> str | None:
     """Reasons this layer cannot be cached correctly. None means it can."""
     if method.is_monolithic:
@@ -308,13 +333,29 @@ def arm(layer, method, logger) -> bool:
             # out: masking makes the output shape depend on device data, and reading
             # that stalls the pipeline once per MoE layer per token. Clamping costs a
             # little LFU bias toward local expert 0 and leaves numerics untouched.
+            # expert_map is fixed for the life of the layer, so its derived index
+            # and not-owned mask are built once here, not rebuilt per token. Doing
+            # it per call cost several elementwise kernels and allocations on every
+            # one of the model's MoE layers, every step.
+            cached = getattr(layer, "_ec_emap_cache", None)
+            if cached is None or cached[0] is not emap:
+                idx = emap.clamp(min=0).to(torch.int64)
+                neg = emap < 0
+                out = torch.empty_like(emap)
+                layer._ec_emap_cache = (emap, idx, neg, out)
+                cached = layer._ec_emap_cache
+            _, emap_idx, emap_neg, composed = cached
+
             local = emap[topk_ids.to(torch.int64)]
+            if _timing_every:
+                _t0 = torch.cuda.Event(enable_timing=True); _t0.record()
             cache.refresh(local.clamp(min=0))
-            composed = torch.where(
-                emap >= 0,
-                cache.table[emap.clamp(min=0).to(torch.int64)].to(emap.dtype),
-                torch.full_like(emap, -1),
-            )
+            if _timing_every:
+                _t_ref = torch.cuda.Event(enable_timing=True); _t_ref.record()
+            # Two kernels into a persistent buffer, rather than gather + where +
+            # full_like + cast into fresh allocations.
+            torch.index_select(cache.table, 0, emap_idx, out=composed)
+            composed.masked_fill_(emap_neg, -1)
             call_ids = topk_ids
             n_owned = local
 
@@ -329,6 +370,18 @@ def arm(layer, method, logger) -> bool:
             layer._expert_map = composed
         try:
             with _slot_bound(layer, cache):
+                if _timing_every:
+                    _t1 = torch.cuda.Event(enable_timing=True); _t1.record()
+                    if composed is not None:
+                        _TIMING["pend_remap"].append((_t0, _t_ref, _t1))
+                    out = orig_apply(layer, x, topk_weights, call_ids,
+                                     shared_experts, shared_experts_input)
+                    _t2 = torch.cuda.Event(enable_timing=True); _t2.record()
+                    _TIMING["pend"].append((_t0, _t1, _t2))
+                    _TIMING["n"] += 1
+                    if _TIMING["n"] % _timing_every == 0:
+                        _drain_timing(logger)
+                    return out
                 return orig_apply(layer, x, topk_weights, call_ids,
                                   shared_experts, shared_experts_input)
         finally:

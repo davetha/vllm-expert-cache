@@ -1,52 +1,50 @@
-# The gather should use the copy engines, not a compute kernel
+# The copy-engine gather: measured, and it does not help
 
-Measured on 2x MI210 (gfx90a) while running GLM-5.3-Flash, 2026-09-14.
+Superseded conclusion. This file previously argued that the gather kernel ran at
+~5.8 GB/s and that switching to hipMemcpyAsync would take a GLM-5.3 decode step
+from 128 ms to ~41 ms. Both halves were wrong. Kept as a record of how.
 
-`expert_cache_gather_k` copies a missed expert by having 256-thread blocks issue
-16-byte loads from the host-mapped source. That is a compute kernel reading over
-PCIe: it is latency-bound and never touches the SDMA copy engines. The
-alternative, `hipMemcpyAsync` from the same buffers, is what the engines are for.
+## What was actually measured, on 2x MI210 (gfx90a), GLM-5.3-Flash decode
 
-Same bytes, same source, measured with `torch.Tensor.copy_` on this hardware:
+| arm | ms/step | tok/s |
+|---|---|---|
+| kernel gather (default) | 130.4-132.6 | 7.54-7.67 |
+| DMA gather (EXPERT_CACHE_DMA=1) | 134.1-137.1 | 7.29-7.46 |
 
-| transfer                      | pinned DMA   | pageable    |
-|-------------------------------|--------------|-------------|
-| w2 packed, 4.2 MB             | 25.51 GB/s   | 16.52 GB/s  |
-| w13 packed, 8.4 MB            | 24.38 GB/s   | 17.55 GB/s  |
-| one expert, 12.6 MB           | 26.84 GB/s   | 17.95 GB/s  |
-| 64 MB bulk                    | 27.49 GB/s   | 18.41 GB/s  |
-| 55 expert copies (one step)   | 27.63 GB/s, 25.1 ms      |
+The DMA path is slightly *slower*. And `tests/test_policy.py` on the same box
+reports the existing kernel at **23-27 GB/s** at production shapes
+(`gather 8 experts: 392.5 us, 26.7 GB/s`), i.e. the same rate an engine copy
+achieves. There was never a 4.7x to win.
 
-The in-engine gather achieves **~5.8 GB/s**. On GLM-5.3 at 32 slots that is
-~650 MB of misses per token per rank taking ~112 ms of a 128 ms decode step.
-At DMA rates the same traffic is ~25 ms, which would take the step to ~41 ms
-(7.8 -> ~24 tok/s).
+## Where the 5.8 GB/s came from
 
-DMA reaches full rate at single-expert sizes -- 0.16 ms for 4 MB, 0.47 ms for
-12.6 MB -- so per-copy launch overhead is not a reason to keep the kernel.
+It was inferred, not measured: the step was 128.8 ms, compute was assumed to be
+~16 ms, the remainder was assumed to be all transfer, and a bandwidth was divided
+out of that assumption. The assumption was false.
 
-## Why the existing tunables cannot close this
+Two later measurements falsify it directly:
 
-`EXPERT_CACHE_CHUNKS` / `EXPERT_CACHE_LANES` set the gather grid. Raising chunks
-16 -> 256 (so ~4 misses per layer occupy 1024 blocks instead of 64) moved a GLM
-decode step 132.8 -> 128.8 ms, about 3%. The copy is not occupancy-limited; it is
-limited by the mechanism. More threads waiting on PCIe latency is not more
-bandwidth.
+- `EXPERT_CACHE_NOGATHER=1` (skip the copy entirely, accept wrong output, keep the
+  timing) moved the step 128.8 -> 120.7 ms. The whole gather is worth ~8 ms, 6% of
+  the step -- not 112 ms.
+- CUDA events around `refresh()` report ~0.9 ms/call, which would be ~38 ms/step,
+  far more than the 8 ms its removal actually saves. The gather overlaps other
+  work, so an event window around it measures queue residency, not exclusive cost.
+  Phase timings taken this way do not sum to the step and must not be treated as
+  a budget.
 
-## Shape of the change
+## Why the DMA path is kept but defaulted off
 
-In `ExpertSlotCache.refresh`, replace the `expert_cache_gather` launches with one
-`hipMemcpyAsync` per (missed expert x mirrored tensor) on a copy stream, then one
-sync before the slot-bound call. The manager already produces the miss list and
-slot assignments, so the bookkeeping is unchanged -- only the copy mechanism
-moves. Two things to watch:
+`_gather_dma()` reads the device-side miss list back to the host, so it needs a
+`stream.synchronize()` per layer. That breaks the invariant this module is built
+on (`cache.py:13`, and README: "Graph capture is worth about 4x, so staying
+capturable dominates every other design consideration"). It costs capturability
+and buys nothing. `EXPERT_CACHE_DMA=1` remains only so the comparison can be
+re-run; there is no configuration in which it is currently the right choice.
 
-- the miss list is device-side, so issuing per-copy from the host needs it read
-  back (a sync) or a device-side enqueue; a sync per layer costs ~8 ms/step on a
-  42-layer model, which would eat a third of the win.
-- the small mirrored tensors (scales, `g_idx`, sort indices) are launch-overhead
-  dominated. Batch them or leave them on the kernel path.
+## What the manager costs
 
-This is not GLM-specific. Any deployment using the cache with
-`--cpu-offload-params experts` pays the same rate on every miss; the win scales
-with miss traffic. Fully-resident models see nothing, correctly.
+`expert_cache_manage` measures **11.6 us/call** in isolation on this box, matching
+the 11.3 us in docs/results.md. An earlier claim in this branch that it cost
+~420 us/call was an artefact of the same event-window mistake described above.
+The kernel is fine.
