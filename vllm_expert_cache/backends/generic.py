@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import os
 import sys
 
 import torch
@@ -37,6 +38,7 @@ from ..config import settings
 _DESC_FIELDS = ("scale", "alpha_or_gscale", "zp", "bias")
 _DESC_NAMES = ("_a1", "_a2", "_w1", "_w2")
 
+_stats_every = int(os.environ.get("EXPERT_CACHE_STATS", "0"))
 _installed = False
 
 
@@ -130,6 +132,23 @@ def _slot_bound(layer, cache: ExpertSlotCache):
     finally:
         for name, t in saved.items():
             _set_tensor(layer, name, t)
+
+
+_STATS = {"n": 0, "miss": 0, "req": 0}
+
+
+def _report_stats(cache, owned_ids, logger) -> None:
+    """Log the running hit rate. Reads device counters, so it syncs -- diagnostic
+    only, and silent unless EXPERT_CACHE_STATS is set to a reporting interval."""
+    _STATS["n"] += 1
+    _STATS["miss"] += int(cache.n_miss.item())
+    _STATS["req"] += int((owned_ids >= 0).sum().item())
+    if _STATS["n"] % _stats_every == 0:
+        logger.info(
+            "expert-cache stats: %d layer-steps, %d routed experts, %d misses "
+            "-> hit rate %.1f%%",
+            _STATS["n"], _STATS["req"], _STATS["miss"],
+            100.0 * (1.0 - _STATS["miss"] / max(1, _STATS["req"])))
 
 
 def _decline(layer, method, num_experts: int) -> str | None:
@@ -272,6 +291,7 @@ def arm(layer, method, logger) -> bool:
             # into slot space directly and tell the layer how many experts that is.
             call_ids = cache.refresh(topk_ids)
             composed = None
+            n_owned = topk_ids
         else:
             # Expert parallelism. expert_map sends global -> local, or -1 for experts
             # this rank does not own. Rather than remap the ids (which would mean
@@ -292,6 +312,10 @@ def arm(layer, method, logger) -> bool:
                 torch.full_like(emap, -1),
             )
             call_ids = topk_ids
+            n_owned = local
+
+        if _stats_every:
+            _report_stats(cache, n_owned, logger)
 
         experts.quant_config = slot_cfg
         method.moe_quant_config = slot_cfg
