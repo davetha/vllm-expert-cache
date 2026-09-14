@@ -141,9 +141,13 @@ def _report_stats(cache, owned_ids, logger) -> None:
     """Log the running hit rate. Reads device counters, so it syncs -- diagnostic
     only, and silent unless EXPERT_CACHE_STATS is set to a reporting interval."""
     _STATS["n"] += 1
+    if _STATS["n"] % _stats_every:
+        # Only the sampled call pays the read-back. Counting every call would put
+        # two device syncs in the hot path and change what is being measured.
+        return
     _STATS["miss"] += int(cache.n_miss.item())
     _STATS["req"] += int((owned_ids >= 0).sum().item())
-    if _STATS["n"] % _stats_every == 0:
+    if True:
         logger.info(
             "expert-cache stats: %d layer-steps, %d routed experts, %d misses "
             "-> hit rate %.1f%%",

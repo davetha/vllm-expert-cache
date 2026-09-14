@@ -95,6 +95,11 @@ class ExpertSlotCache:
         self.decay = settings.decay
         self.chunks = int(os.environ.get("EXPERT_CACHE_CHUNKS", "16"))
         self.lanes = int(os.environ.get("EXPERT_CACHE_LANES", "64"))
+        # Off by default: the copies themselves are ~4.7x faster than the gather
+        # kernel, but this path has to read the device-side miss list back per
+        # call, and that has not yet been shown to come out ahead end to end.
+        # Set EXPERT_CACHE_DMA=1 to use it.
+        self.dma_gather = os.environ.get("EXPERT_CACHE_DMA", "0") != "0"
 
     def fits(self, topk_ids: torch.Tensor) -> bool:
         """Can this step be served entirely from slots?
@@ -132,6 +137,41 @@ class ExpertSlotCache:
         if rc != 0:
             raise RuntimeError(f"expert_cache_manage failed rc={rc}")
 
+        if self.dma_gather:
+            self._gather_dma()
+        else:
+            self._gather_kernel(h, stream)
+
+        return self.remap(topk_ids)
+
+    def _gather_dma(self) -> None:
+        """Copy each missed expert with the copy engines instead of a kernel.
+
+        expert_cache_gather_k moves a slab by having 256-thread blocks issue
+        16-byte loads from the host-mapped source. That is latency-bound over
+        PCIe and never reaches SDMA: measured ~5.8 GB/s against 24-27 GB/s for
+        the same buffers under an engine copy (docs/DMA_GATHER.md).
+
+        Tensor.copy_ takes the engine path even though the source is a UVA view
+        whose .device reads as the accelerator -- the runtime knows the
+        allocation is host-backed. Measured identical to a copy from the CPU
+        tensor itself, 27.6 GB/s either way.
+
+        The miss list lives on the device, so issuing per-copy from the host
+        costs one read-back per call. That is the price of the mechanism swap
+        and it is much smaller than what it buys.
+        """
+        n = int(self.n_miss.item())
+        if n <= 0:
+            return
+        pairs = self.miss[: 2 * n].tolist()
+        for name in self.names:
+            dst = self.slots[name]
+            src = getattr(self.owner, name).data
+            for j in range(n):
+                dst[pairs[2 * j + 1]].copy_(src[pairs[2 * j]], non_blocking=True)
+
+    def _gather_kernel(self, h, stream) -> None:
         dsts, srcs = [], []
         for n in self.names:
             dsts.append(self.slots[n])
@@ -159,5 +199,3 @@ class ExpertSlotCache:
             )
             if rc != 0:
                 raise RuntimeError(f"expert_cache_gather failed rc={rc}")
-
-        return self.remap(topk_ids)
