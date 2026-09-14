@@ -142,11 +142,11 @@ def _decline(layer, method, num_experts: int) -> str | None:
         return "method has no moe_kernel (legacy non-modular path)"
     if getattr(method.moe_kernel, "fused_experts", None) is None:
         return "moe_kernel exposes no fused_experts to rebind"
-    if getattr(layer, "expert_map", None) is not None:
-        # With expert parallelism topk_ids are global ids that expert_map folds into a
-        # local range; composing that with the slot table is a second remap this does
-        # not implement.
-        return "expert parallelism active (layer.expert_map is set)"
+    if getattr(method.moe_kernel.fused_experts, "consumes_expert_mask", False):
+        # Under EP this kernel reads the 0/1 expert_mask rather than the
+        # -1/local-id expert_map, so the slot table cannot be folded into it the
+        # way apply() does below.
+        return "kernel consumes expert_mask (slot composition not implemented)"
     if settings.slots_for(num_experts) >= num_experts:
         return None  # not an error: nothing to cache, handled by the caller
     return None
@@ -261,20 +261,53 @@ def arm(layer, method, logger) -> bool:
             return orig_apply(layer, x, topk_weights, topk_ids,
                               shared_experts, shared_experts_input)
 
-        slot_ids = cache.refresh(topk_ids)
+        emap = getattr(layer, "expert_map", None)
         experts = method.moe_kernel.fused_experts
-        saved = (experts.quant_config, method.moe_quant_config,
-                 layer.global_num_experts)
+        saved_cfg = (experts.quant_config, method.moe_quant_config)
+        saved_n = layer.global_num_experts
+        saved_emap = getattr(layer, "_expert_map", None)
+
+        if emap is None:
+            # No expert parallelism: routing ids are already local, so rewrite them
+            # into slot space directly and tell the layer how many experts that is.
+            call_ids = cache.refresh(topk_ids)
+            composed = None
+        else:
+            # Expert parallelism. expert_map sends global -> local, or -1 for experts
+            # this rank does not own. Rather than remap the ids (which would mean
+            # reimplementing the -1 handling), fold the slot table INTO expert_map so
+            # the kernel applies one composed global -> slot map and keeps its own
+            # not-owned semantics. Routing ids stay global, so global_num_experts must
+            # keep describing the global id space.
+            #
+            # The manager is fed the local ids with -1 clamped to 0 rather than masked
+            # out: masking makes the output shape depend on device data, and reading
+            # that stalls the pipeline once per MoE layer per token. Clamping costs a
+            # little LFU bias toward local expert 0 and leaves numerics untouched.
+            local = emap[topk_ids.to(torch.int64)]
+            cache.refresh(local.clamp(min=0))
+            composed = torch.where(
+                emap >= 0,
+                cache.table[emap.clamp(min=0).to(torch.int64)].to(emap.dtype),
+                torch.full_like(emap, -1),
+            )
+            call_ids = topk_ids
+
         experts.quant_config = slot_cfg
         method.moe_quant_config = slot_cfg
-        layer.global_num_experts = cache.S
+        if composed is None:
+            layer.global_num_experts = cache.S
+        else:
+            layer._expert_map = composed
         try:
             with _slot_bound(layer, cache):
-                return orig_apply(layer, x, topk_weights, slot_ids,
+                return orig_apply(layer, x, topk_weights, call_ids,
                                   shared_experts, shared_experts_input)
         finally:
-            (experts.quant_config, method.moe_quant_config,
-             layer.global_num_experts) = saved
+            experts.quant_config, method.moe_quant_config = saved_cfg
+            layer.global_num_experts = saved_n
+            if composed is not None:
+                layer._expert_map = saved_emap
 
     method.apply = apply
     layer._expert_cache = cache

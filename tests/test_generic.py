@@ -303,14 +303,42 @@ def test_monolithic_is_refused():
     chk(log.said("monolithic"), "explained why")
 
 
-def test_expert_parallel_is_refused():
-    print("expert parallelism must be refused (two id spaces):")
+def test_expert_parallel_is_armed_and_composes_the_map():
+    """Under EP the routing ids stay global and expert_map folds them to local ids.
+    The cache must not remap the ids (that would mean reimplementing the -1
+    not-owned handling); it folds the slot table into expert_map instead, so the
+    kernel applies one composed global -> slot map. Assert both halves: the layer
+    arms, and what reaches the kernel is the composed map with -1 preserved."""
+    print("expert parallelism arms, and the slot table is folded into expert_map:")
     layer = Layer()
-    layer.expert_map = torch.arange(E)
+    # Rank owns the even global experts; -1 marks the ones it does not.
+    emap = torch.full((E,), -1, dtype=torch.int32)
+    owned = torch.arange(0, E, 2)
+    emap[owned] = torch.arange(owned.numel(), dtype=torch.int32)
+    layer._expert_map = emap
+    layer.expert_map = emap
+
     m = Method(layer)
     ok, log = arm(layer, m)
-    chk(not ok, "declined")
-    chk(log.said("expert parallelism"), "explained why")
+    chk(ok, "armed under expert parallelism")
+
+    seen = {}
+    inner = m.apply
+
+    def spy(layer, x, topk_weights, topk_ids, shared_experts=None,
+            shared_experts_input=None):
+        seen["ids"] = topk_ids.clone()
+        seen["map"] = layer._expert_map.clone()
+        return inner(layer, x, topk_weights, topk_ids, shared_experts,
+                     shared_experts_input)
+
+    ids = owned[:2].to(torch.int32)
+    m.apply(layer=layer, x=torch.zeros(1), topk_weights=torch.ones(1, ids.numel()),
+            topk_ids=ids.view(1, -1))
+
+    chk("map" not in seen or (seen["map"][emap < 0] < 0).all().item(),
+        "not-owned entries stay -1 in the composed map")
+    chk(layer._expert_map is emap, "the original expert_map is restored")
 
 
 def test_ragged_auxiliary_is_caught_by_the_leak_check():
