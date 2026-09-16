@@ -31,7 +31,10 @@ import sys
 
 import torch
 
-from ..cache import ExpertSlotCache
+from .. import fused_remap
+
+_FUSED_REMAP = os.environ.get("EXPERT_CACHE_FUSED_REMAP", "1") != "0"
+from ..cache import ExpertSlotCache, WideScratch
 from ..config import settings
 
 # Fields on a FusedMoEQuantDesc that can hold a per-expert tensor.
@@ -122,16 +125,21 @@ def _leaked_full_tensors(cfg, num_experts: int) -> list[str]:
 
 
 @contextlib.contextmanager
-def _slot_bound(layer, cache: ExpertSlotCache):
-    """Point every mirrored attribute at its slot buffer for the duration of the block."""
-    saved = {name: getattr(layer, name) for name in cache.bound}
+def _bound_to(layer, mapping):
+    """Point every mirrored attribute at the given replacement for the duration."""
+    saved = {name: getattr(layer, name) for name in mapping}
     try:
-        for name, slot in cache.bound.items():
-            _set_tensor(layer, name, slot)
+        for name, buf in mapping.items():
+            _set_tensor(layer, name, buf)
         yield
     finally:
         for name, t in saved.items():
             _set_tensor(layer, name, t)
+
+
+def _slot_bound(layer, cache: ExpertSlotCache):
+    """Point every mirrored attribute at its slot buffer for the duration of the block."""
+    return _bound_to(layer, cache.bound)
 
 
 _STATS = {"n": 0, "miss": 0, "req": 0}
@@ -200,6 +208,29 @@ def _decline(layer, method, num_experts: int) -> str | None:
     return None
 
 
+def _is_offloaded(layer, *names) -> bool:
+    """True if these expert weights actually live in host memory.
+
+    Caching a layer whose weights never left the GPU is worse than pointless: the slot
+    buffers cost real VRAM (12.38 MiB per slot per layer on GLM-5.3-Flash) and every step
+    still runs a manager and a gather that copy VRAM to VRAM for a lookup that cannot
+    miss. Measured on a 42-layer run with a 28 GiB offload budget, 25 of 42 layers were
+    fully resident and held 2.45 GiB/rank of slots they could never use.
+
+    vLLM's UVA offloader leaves `.device` reading as the accelerator, because an offloaded
+    parameter becomes a device-addressable VIEW of pinned host memory. Its own marker is
+    the only reliable signal, so read that, and consult the device only for the non-UVA
+    path, which really does move the tensor to CPU.
+    """
+    for name in names:
+        t = getattr(layer, name, None)
+        if t is None:
+            continue
+        if getattr(t, "_vllm_is_uva_offloaded", False) or t.device.type == "cpu":
+            return True
+    return False
+
+
 def _weight_names(layer) -> tuple[str, str] | None:
     """The registered names of the two expert weight matrices, whatever they are called.
 
@@ -229,6 +260,16 @@ def arm(layer, method, logger) -> bool:
                 "layer registers %s", type(method).__name__, ", ".join(present) or "nothing")
         return False
     w13_name, w2_name = names
+
+    if (os.environ.get("EXPERT_CACHE_DECLINE_RESIDENT", "1") != "0"
+            and not _is_offloaded(layer, w13_name, w2_name)):
+        # Not an error, and not silent: which layers the offloader reached depends on
+        # --cpu-offload-gb, so this line is how you see that the budget stopped short.
+        logger.info(
+            "expert-cache: not caching %s -- its experts are still GPU-resident, so a "
+            "cache would only spend VRAM and copy weights to themselves. Raise "
+            "--cpu-offload-gb to put this layer on the host.", type(method).__name__)
+        return False
 
     num_experts = getattr(layer, w13_name).size(0)
     slots = settings.slots_for(num_experts)
@@ -288,6 +329,32 @@ def arm(layer, method, logger) -> bool:
     with _slot_bound(layer, cache):
         slot_cfg = method.get_fused_moe_quant_config(layer)
 
+    # Wide (prefill) steps. The scratch is full-size and indexed by local expert id, so
+    # unlike the slot path NOTHING here is remapped -- which is also why the leak check
+    # below must not run against it: every per-expert tensor staying at [E] is correct.
+    scratch = wide_cfg = None
+    if settings.wide_scratch:
+        try:
+            scratch = WideScratch.acquire(cache, cache.table.device)
+            if not scratch.bound:
+                for first, group in sources.items():
+                    if first not in scratch.buf:
+                        continue
+                    buf = scratch.buf[first]
+                    as_param = torch.nn.Parameter(buf, requires_grad=False)
+                    for name in group:
+                        scratch.bound[name] = (
+                            as_param if name in layer._parameters else buf)
+            with _bound_to(layer, scratch.bound):
+                wide_cfg = method.get_fused_moe_quant_config(layer)
+        except Exception as e:
+            # Disclosed, not silent: without this the layer still computes correctly,
+            # it just reads the host copies through the GEMM the slow way.
+            logger.warning(
+                "expert-cache: wide-step scratch unavailable (%r); prefill will read "
+                "through to host memory. Set EXPERT_CACHE_WIDE_SCRATCH=0 to silence.", e)
+            scratch = wide_cfg = None
+
     if slot_cfg is not None:
         leaked = _leaked_full_tensors(slot_cfg, num_experts)
         if leaked:
@@ -298,16 +365,33 @@ def arm(layer, method, logger) -> bool:
             return False
 
     orig_apply = method.apply
+    experts_ref = method.moe_kernel.fused_experts
 
     # Parameter names must match the base class exactly: vLLM calls this by keyword
     # (apply(layer=..., x=..., ...)), so renaming even the first one breaks the call.
     def apply(layer, x, topk_weights, topk_ids, shared_experts=None,
               shared_experts_input=None):
         if not cache.fits(topk_ids):
-            # Wide / prefill steps touch more distinct experts than there are slots and
-            # read through the host copies on the stock path.
-            return orig_apply(layer, x, topk_weights, topk_ids,
-                              shared_experts, shared_experts_input)
+            # Wide / prefill steps touch more distinct experts than there are slots, so
+            # they cannot be served from the slot table. Stage the whole local expert set
+            # into VRAM with the gather kernel and compute from there: same bytes over
+            # the same link, but ~24 GB/s of wide contiguous copies instead of the GEMM
+            # picking at host memory at ~7 GB/s. Falls back to the stock read-through
+            # path when no scratch was allocated.
+            if scratch is None:
+                return orig_apply(layer, x, topk_weights, topk_ids,
+                                  shared_experts, shared_experts_input)
+            scratch.fill(layer, cache.chunks, cache.lanes)
+            w_saved = (experts_ref.quant_config, method.moe_quant_config)
+            if wide_cfg is not None:
+                experts_ref.quant_config = wide_cfg
+                method.moe_quant_config = wide_cfg
+            try:
+                with _bound_to(layer, scratch.bound):
+                    return orig_apply(layer, x, topk_weights, topk_ids,
+                                      shared_experts, shared_experts_input)
+            finally:
+                experts_ref.quant_config, method.moe_quant_config = w_saved
 
         emap = getattr(layer, "expert_map", None)
         experts = method.moe_kernel.fused_experts
@@ -329,33 +413,45 @@ def arm(layer, method, logger) -> bool:
             # not-owned semantics. Routing ids stay global, so global_num_experts must
             # keep describing the global id space.
             #
-            # The manager is fed the local ids with -1 clamped to 0 rather than masked
-            # out: masking makes the output shape depend on device data, and reading
-            # that stalls the pipeline once per MoE layer per token. Clamping costs a
-            # little LFU bias toward local expert 0 and leaves numerics untouched.
+            # The manager is fed the local ids with their -1s INTACT. Masking them out
+            # would make the output shape depend on device data and stall the pipeline
+            # once per MoE layer per token. Clamping them to 0 -- what this used to do --
+            # avoided that stall but handed the manager one phantom request for local
+            # expert 0 per non-owned slot, on every call. At top_k=8 with half the
+            # experts non-owned that is ~4 phantoms against ~4 real ids: expert 0 became
+            # permanently the hottest entry, pinning a slot, and the LFU counts it sorts
+            # on were mostly noise (measured 2026-09-15: hit rate 35%, and lfu beat lru
+            # by 0.5pp because neither policy had usable statistics). Passing the -1s
+            # through costs nothing: expert_cache_manage_k documents its ids as
+            # `<0 = padding` and already guards every read with `e >= 0 && e < E`.
             # expert_map is fixed for the life of the layer, so its derived index
             # and not-owned mask are built once here, not rebuilt per token. Doing
             # it per call cost several elementwise kernels and allocations on every
             # one of the model's MoE layers, every step.
             cached = getattr(layer, "_ec_emap_cache", None)
             if cached is None or cached[0] is not emap:
-                idx = emap.clamp(min=0).to(torch.int64)
-                neg = emap < 0
                 out = torch.empty_like(emap)
-                layer._ec_emap_cache = (emap, idx, neg, out)
+                layer._ec_emap_cache = (emap, out, {})
                 cached = layer._ec_emap_cache
-            _, emap_idx, emap_neg, composed = cached
+            _, composed, local_bufs = cached
 
-            local = emap[topk_ids.to(torch.int64)]
+            if _FUSED_REMAP:
+                local = fused_remap.gather_local(emap, topk_ids, local_bufs)
+            else:
+                local = emap[topk_ids.to(torch.int64)]
             if _timing_every:
                 _t0 = torch.cuda.Event(enable_timing=True); _t0.record()
-            cache.refresh(local.clamp(min=0))
+            cache.refresh(local)
             if _timing_every:
                 _t_ref = torch.cuda.Event(enable_timing=True); _t_ref.record()
-            # Two kernels into a persistent buffer, rather than gather + where +
-            # full_like + cast into fresh allocations.
-            torch.index_select(cache.table, 0, emap_idx, out=composed)
-            composed.masked_fill_(emap_neg, -1)
+            # One kernel into a persistent buffer. The gather and the not-owned mask
+            # are the same pass; at 288 experts these were dispatch, not work.
+            if _FUSED_REMAP:
+                fused_remap.compose(cache.table, emap, composed)
+            else:
+                torch.index_select(cache.table, 0,
+                                   emap.clamp(min=0).to(torch.int64), out=composed)
+                composed.masked_fill_(emap < 0, -1)
             call_ids = topk_ids
             n_owned = local
 
@@ -395,6 +491,60 @@ def arm(layer, method, logger) -> bool:
     return True
 
 
+def _install_offload_order(logger) -> None:
+    """Choose WHICH layers the offloader sends to host, instead of taking construction order.
+
+    vLLM offloads modules in the order they are built until a byte budget runs out, so
+    which layers end up on the host is an accident. That would be fine if layers were
+    interchangeable, but they are not: measured on a real routing trace at 46 slots,
+    per-layer LFU hit rate ranges from 46% to 89%, shallow layers routing almost
+    uniformly while deep ones concentrate on a stable favourite set. A layer that caches
+    well is CHEAP to offload; a flat-routing one is expensive. The default order offloads
+    the flat ones first.
+
+    EXPERT_CACHE_OFFLOAD_SKIP=<n>: do not offload the first n modules, so the budget is
+    spent on the deeper ones instead. 0 (default) leaves vLLM's behaviour untouched.
+
+    DO NOT reorder by materialising the generator. `modules_generator` BUILDS each layer
+    as it is pulled, and the stock list comprehension frees a layer's VRAM by offloading
+    it before the next is created. Calling list() on it first allocates every layer on
+    the GPU at once -- 63.23 GiB, then OOM partway through creating expert weights.
+    Deciding per module as it arrives keeps that lazy property intact.
+    """
+    try:
+        skip = int(os.environ.get("EXPERT_CACHE_OFFLOAD_SKIP", "0"))
+    except ValueError:
+        skip = 0
+    if skip <= 0:
+        return
+    try:
+        from vllm.model_executor.offloader.uva import UVAOffloader
+        from vllm.utils.mem_utils import format_gib
+    except Exception as e:
+        logger.warning("expert-cache: cannot steer offload placement (%r)", e)
+        return
+
+    state = {"n": 0}
+
+    def wrap_modules(self, modules_generator, prefix: str = ""):
+        pfx = f"{prefix}." if prefix else ""
+        out = []
+        for module in modules_generator:          # stays lazy -- see the docstring
+            i = state["n"]
+            state["n"] += 1
+            if i < skip:
+                out.append(module)                # held resident on purpose
+            else:
+                out.append(self._maybe_offload_to_cpu(module, pfx))
+        if self.cpu_offload_bytes > 0:
+            logger.info("expert-cache: held the first %d modules resident; %s offloaded",
+                        skip, format_gib(self.cpu_offload_bytes))
+        return out
+
+    UVAOffloader.wrap_modules = wrap_modules
+    logger.info("expert-cache: offload placement will skip the first %d modules", skip)
+
+
 def install(logger) -> bool:
     """Patch vLLM's single post-load hook so every MoE layer is armed after loading."""
     global _installed
@@ -408,6 +558,8 @@ def install(logger) -> bool:
     except Exception as e:
         logger.debug("expert-cache: vLLM MoE interfaces unavailable (%r)", e)
         return False
+
+    _install_offload_order(logger)
 
     orig = loader_utils.process_weights_after_loading
 

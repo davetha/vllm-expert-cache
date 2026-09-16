@@ -35,6 +35,16 @@ class _Settings:
         return {"lru": 0, "lfu": 1}.get(self.policy, 0)
 
     @property
+    def wide_scratch(self) -> bool:
+        """Stage all local experts into VRAM for steps too wide to serve from slots.
+
+        Costs one full-size buffer per layer geometry (E x per-expert bytes, shared by
+        every layer of that shape), and buys the difference between the GEMM reading
+        host memory at ~7 GB/s and the gather kernel streaming it at ~24 GB/s.
+        """
+        return os.environ.get("EXPERT_CACHE_WIDE_SCRATCH", "1") != "0"
+
+    @property
     def decay(self) -> int:
         """LFU only: halve every N steps so stale-hot experts age out. 0 disables."""
         return int(os.environ.get("EXPERT_CACHE_DECAY", "64"))
